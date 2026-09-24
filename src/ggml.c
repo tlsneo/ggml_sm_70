@@ -3336,7 +3336,7 @@ GGML_API struct ggml_tensor * ggml_mul_mat_i8_tensorwise(
     }
     GGML_ASSERT(n == 0 || n == 1);
 
-    const struct ggml_tensor * logical_input = input;
+    struct ggml_tensor * logical_input = input;
     if (input->type == GGML_TYPE_I8) {
         GGML_ASSERT(input->op == GGML_OP_QUANTIZE_I8_CONVROT);
         GGML_ASSERT(input->src[0] != NULL);
@@ -3356,6 +3356,7 @@ GGML_API struct ggml_tensor * ggml_mul_mat_i8_tensorwise(
     result->src[1]              = input;
     result->src[2]              = weight_scale;
     result->src[3]              = bias;
+    result->src[4]              = input->type == GGML_TYPE_I8 ? logical_input : NULL;
     ggml_set_op_params_i32(result, 2, convrot_group_size);
     return result;
 }

@@ -45,6 +45,7 @@
 #include "ggml-cuda/rope.cuh"
 #include "ggml-cuda/roll.cuh"
 #include "ggml-cuda/scale.cuh"
+#include "ggml-cuda/sm70-w8a16.cuh"
 #include "ggml-cuda/snake.cuh"
 #include "ggml-cuda/softcap.cuh"
 #include "ggml-cuda/softmax.cuh"
@@ -1718,10 +1719,35 @@ static void ggml_cuda_mul_mat_i8(
     const int64_t scale_rows  = (rows * (int64_t)sizeof(float) + k - 1) / k;
     const int64_t qstride     = k;
     const int convrot_group_size = ggml_get_op_params_i32(dst, 2);
+    const ggml_tensor * logical_input = prequantized ? dst->src[4] : src1;
     GGML_ASSERT(src1->ne[0] == k);
     GGML_ASSERT(!prequantized || (src1->op == GGML_OP_QUANTIZE_I8_CONVROT &&
                                   src1->ne[1] == rows_padded + scale_rows));
+    GGML_ASSERT(logical_input != nullptr && logical_input->type == GGML_TYPE_F32);
+    GGML_ASSERT(logical_input->ne[0] == k && ggml_nrows(logical_input) == rows);
+    GGML_ASSERT(ggml_is_contiguous(logical_input));
     GGML_ASSERT(convrot_group_size == 0 || convrot_group_size == 256);
+
+    const float * weight_scales = dst->src[2] != nullptr ? (const float *) dst->src[2]->data : nullptr;
+    const float * bias          = dst->src[3] != nullptr ? (const float *) dst->src[3]->data : nullptr;
+    const int cc = ggml_cuda_info().devices[ctx.device].cc;
+    if (volta_mma_available(cc)) {
+        GGML_ASSERT(convrot_group_size == 256);
+        ggml_cuda_pool_alloc<half> activation_f16(ctx.pool(), (size_t) k * rows);
+        ggml_cuda_pool_alloc<half> weight_f16(ctx.pool(), (size_t) k * n);
+        ggml_cuda_pool_alloc<float> activation_scales(ctx.pool(), rows);
+        ggml_cuda_mul_mat_i8_sm70_w8a16(
+            (const int8_t *) src0->data,
+            (const float *) logical_input->data,
+            weight_scales,
+            bias,
+            (float *) dst->data,
+            activation_f16.get(),
+            weight_f16.get(),
+            activation_scales.get(),
+            k, n, rows, ctx.stream(), ctx.cublas_handle());
+        return;
+    }
 
     ggml_cuda_pool_alloc<int8_t> qdata(ctx.pool());
     ggml_cuda_pool_alloc<float> scales(ctx.pool());
@@ -1744,8 +1770,6 @@ static void ggml_cuda_mul_mat_i8(
             ctx, (const float *)src1->data, qdata_d, scales_d, k, rows, rows_padded, k);
     }
 
-    const float * weight_scales = dst->src[2] != nullptr ? (const float *)dst->src[2]->data : nullptr;
-    const float * bias          = dst->src[3] != nullptr ? (const float *)dst->src[3]->data : nullptr;
     ggml_cuda_pool_alloc<int32_t> accum(ctx.pool(), (size_t)n * rows_padded);
 
     const int32_t alpha = 1;
@@ -5468,6 +5492,15 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                                                        b->op == GGML_OP_QUANTIZE_I8_CONVROT &&
                                                        packed_src != nullptr && b->ne[0] == a->ne[0] &&
                                                        b->ne[1] == packed_rows + packed_scale_rows;
+                    const ggml_tensor * logical_input = packed_input ? op->src[4] : b;
+                    const int cc = ggml_cuda_info().devices[dev_ctx->device].cc;
+                    const bool sm70_w8a16 = volta_mma_available(cc) && convrot_group_size == 256 &&
+                                              logical_input != nullptr &&
+                                              logical_input->type == GGML_TYPE_F32 &&
+                                              logical_input->ne[0] == a->ne[0] &&
+                                              ggml_nrows(logical_input) == ggml_nrows(op) &&
+                                              ggml_is_contiguous(logical_input) &&
+                                              (!packed_input || logical_input == packed_src);
                     return op->op == GGML_OP_MUL_MAT && (b->type == GGML_TYPE_F32 || packed_input) &&
                            op->type == GGML_TYPE_F32 && a->ne[0] % 4 == 0 && a->ne[1] % 4 == 0 &&
                            a->ne[2] == 1 && a->ne[3] == 1 &&
@@ -5479,7 +5512,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                             (bias->type == GGML_TYPE_F32 && ggml_is_contiguous(bias) &&
                              ggml_nelements(bias) == a->ne[1])) &&
                            (convrot_group_size == 0 || (convrot_group_size == 256 && a->ne[0] % 256 == 0)) &&
-                           turing_mma_available(ggml_cuda_info().devices[dev_ctx->device].cc);
+                           (turing_mma_available(cc) || sm70_w8a16);
 #else
                     return false;
 #endif

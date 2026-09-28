@@ -1698,6 +1698,11 @@ static bool ggml_cuda_op_quantize_i8_convrot(
     return true;
 }
 
+static bool ggml_cuda_use_sm70_w8a16(ggml_backend_cuda_context & ctx, const ggml_tensor * dst) {
+    const int cc = ggml_cuda_info().devices[ctx.device].cc;
+    return volta_mma_available(cc) && ggml_get_op_params_i32(dst, 2) == 256;
+}
+
 static void ggml_cuda_mul_mat_i8(
         ggml_backend_cuda_context & ctx,
         const ggml_tensor * src0,
@@ -1730,8 +1735,7 @@ static void ggml_cuda_mul_mat_i8(
 
     const float * weight_scales = dst->src[2] != nullptr ? (const float *) dst->src[2]->data : nullptr;
     const float * bias          = dst->src[3] != nullptr ? (const float *) dst->src[3]->data : nullptr;
-    const int cc = ggml_cuda_info().devices[ctx.device].cc;
-    if (volta_mma_available(cc)) {
+    if (ggml_cuda_use_sm70_w8a16(ctx, dst)) {
         GGML_ASSERT(convrot_group_size == 256);
         ggml_cuda_pool_alloc<half> activation_f16(ctx.pool(), (size_t) k * rows);
         ggml_cuda_pool_alloc<half> weight_f16(ctx.pool(), (size_t) k * n);
@@ -2259,7 +2263,8 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
     }
 }
 
-static void ggml_cuda_mul_mat_cublas(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+static ggml_type ggml_cuda_mul_mat_cublas_compute_type(
+        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * dst) {
     const int cc = ggml_cuda_info().devices[ctx.device].cc;
     ggml_type compute_type = src0->type;
     if (compute_type == GGML_TYPE_F8_E4M3 || compute_type == GGML_TYPE_F8_E5M2) {
@@ -2286,11 +2291,14 @@ static void ggml_cuda_mul_mat_cublas(ggml_backend_cuda_context & ctx, const ggml
         } else if (env_cpp == "bf16") {
             compute_type = GGML_TYPE_BF16;
         } else if (env_cpp != "auto") {
-            GGML_LOG_WARN("%s: unknown value for GGML_CUDA_CUBLAS_COMPUTE_TYPE: %s", __func__, env_cpp.c_str());
+            GGML_LOG_WARN("ggml_cuda_mul_mat_cublas: unknown value for GGML_CUDA_CUBLAS_COMPUTE_TYPE: %s", env_cpp.c_str());
         }
     }
+    return compute_type;
+}
 
-    switch (compute_type) {
+static void ggml_cuda_mul_mat_cublas(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    switch (ggml_cuda_mul_mat_cublas_compute_type(ctx, src0, dst)) {
         case GGML_TYPE_F32:
             ggml_cuda_mul_mat_cublas_impl<GGML_TYPE_F32>(ctx, src0, src1, dst);
             break;
@@ -2455,6 +2463,52 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
     return use_mul_mat_vec_q;
 }
 
+enum class ggml_cuda_mul_mat_route {
+    CUBLAS,
+    MMVF,
+    MMVF_TRANSPOSED,
+    MMF,
+    MMVQ,
+    MMQ,
+};
+
+static ggml_cuda_mul_mat_route ggml_cuda_select_mul_mat_route(
+        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
+    GGML_TENSOR_BINARY_OP_LOCALS
+
+    // If src0 is a temporary compute buffer it may have some padding that needs to be cleared for mul_mat_vec_q or mul_mat_q.
+    // But if src0 is also a view of another tensor then this cannot be done safely because it may overwrite valid tensor data.
+    // Therefore, in such cases use cuBLAS.
+    const bool bad_padding_clear = ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE
+        && ggml_nbytes(src0) != ggml_backend_buffer_get_alloc_size(src0->buffer, src0) && src0->view_src;
+    if (bad_padding_clear || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
+        return ggml_cuda_mul_mat_route::CUBLAS;
+    }
+
+    const int cc        = ggml_cuda_info().devices[ctx.device].cc;
+    const int warp_size = ggml_cuda_info().devices[ctx.device].warp_size;
+
+    if (ggml_cuda_should_use_mmvf(src0->type, cc, src0->ne, src0->nb, ne11)) {
+        return ggml_cuda_mul_mat_route::MMVF;
+    }
+    if (ne01 == 1 && ne11 > MMVF_MAX_BATCH_SIZE && ne2 == 1 && ne3 == 1
+            && src0->type == GGML_TYPE_F32
+            && ggml_is_contiguous(src0) && ggml_is_contiguous(src1) && ggml_is_contiguous(dst)
+            && ggml_cuda_should_use_mmvf(src1->type, cc, src1->ne, src1->nb, /*ne11 =*/ 1)) {
+        return ggml_cuda_mul_mat_route::MMVF_TRANSPOSED;
+    }
+    if (ggml_cuda_should_use_mmf(src0->type, cc, warp_size, src0->ne, src0->nb, ne11, /*mul_mat_id =*/ false)) {
+        return ggml_cuda_mul_mat_route::MMF;
+    }
+    if (ggml_cuda_should_use_mmvq(src0->type, cc, ne11)) {
+        return ggml_cuda_mul_mat_route::MMVQ;
+    }
+    if (ggml_cuda_should_use_mmq(src0->type, cc, ne11, /*n_experts =*/ 0)) {
+        return ggml_cuda_mul_mat_route::MMQ;
+    }
+    return ggml_cuda_mul_mat_route::CUBLAS;
+}
+
 static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     GGML_TENSOR_BINARY_OP_LOCALS
 
@@ -2479,52 +2533,89 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     }
 #endif
 
-    // If src0 is a temporary compute buffer it may have some padding that needs to be cleared for mul_mat_vec_q or mul_mat_q.
-    // But if src0 is also a view of another tensor then this cannot be done safely because it may overwrite valid tensor data.
-    // Therefore, in such cases use cuBLAS.
-    const bool bad_padding_clear = ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE
-        && ggml_nbytes(src0) != ggml_backend_buffer_get_alloc_size(src0->buffer, src0) && src0->view_src;
-    if (bad_padding_clear || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
-        ggml_cuda_mul_mat_cublas(ctx, src0, src1, dst);
-        return;
+    switch (ggml_cuda_select_mul_mat_route(ctx, src0, src1, dst)) {
+        case ggml_cuda_mul_mat_route::CUBLAS:
+            ggml_cuda_mul_mat_cublas(ctx, src0, src1, dst);
+            return;
+        case ggml_cuda_mul_mat_route::MMVF:
+            // The custom F16 vector kernel can be used over batched cuBLAS GEMM.
+            // But this is only faster for GPUs without tensor cores or with a thin src0 matrix (particularly KQV in attention).
+            ggml_cuda_mul_mat_vec_f(ctx, src0, src1, nullptr, dst);
+            return;
+        case ggml_cuda_mul_mat_route::MMVF_TRANSPOSED: {
+            // A transposed vector can still use MMVF (i.e. ne01 == 1).
+            ggml_tensor dst_vec = *dst;
+            dst_vec.ne[0] = ne11;
+            dst_vec.ne[1] = 1;
+            dst_vec.nb[1] = dst_vec.nb[0]*ne11;
+            dst_vec.nb[2] = dst_vec.nb[1];
+            dst_vec.nb[3] = dst_vec.nb[1];
+            ggml_cuda_mul_mat_vec_f(ctx, src1, src0, nullptr, &dst_vec);
+            return;
+        }
+        case ggml_cuda_mul_mat_route::MMF:
+            ggml_cuda_mul_mat_f(ctx, src0, src1, nullptr, dst);
+            return;
+        case ggml_cuda_mul_mat_route::MMVQ:
+            ggml_cuda_mul_mat_vec_q(ctx, src0, src1, nullptr, dst);
+            return;
+        case ggml_cuda_mul_mat_route::MMQ:
+            ggml_cuda_mul_mat_q(ctx, src0, src1, nullptr, dst);
+            return;
+    }
+    GGML_ABORT("fatal error");
+}
+
+static const char * ggml_cuda_cublas_route_name(
+        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * dst) {
+    switch (ggml_cuda_mul_mat_cublas_compute_type(ctx, src0, dst)) {
+        case GGML_TYPE_F16:  return "CUBLAS_F16";
+        case GGML_TYPE_F32:  return "CUBLAS_F32";
+        case GGML_TYPE_BF16: return "CUBLAS_BF16";
+        default:             return "UNKNOWN";
+    }
+}
+
+static const char * ggml_cuda_mul_mat_route_name(ggml_backend_cuda_context & ctx, const ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+    if (src0 == nullptr || src1 == nullptr) {
+        return "UNKNOWN";
     }
 
-    const int cc        = ggml_cuda_info().devices[ctx.device].cc;
-    const int warp_size = ggml_cuda_info().devices[ctx.device].warp_size;
+    if (ggml_get_op_params_i32(dst, 1) == GGML_HINT_SRC0_IS_HADAMARD) {
+        return "UNKNOWN";
+    }
+    if (src0->type == GGML_TYPE_I8) {
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+        return ggml_cuda_use_sm70_w8a16(ctx, dst) ? "W8A16_SM70_CUBLAS" : "I8_CUBLAS";
+#else
+        return "UNSUPPORTED";
+#endif
+    }
+#ifdef GGML_CUDA_USE_CUBLASLT_FP8
+    if (ggml_cuda_should_use_fp8_matmul(ctx, src0, src1, dst)) {
+        return "UNKNOWN";
+    }
+#endif
+    if (src0->buffer == nullptr) {
+        return "UNKNOWN";
+    }
 
-    if (ggml_cuda_should_use_mmvf(src0->type, cc, src0->ne, src0->nb, ne11)) {
-        // The custom F16 vector kernel can be used over batched cuBLAS GEMM.
-        // But this is only faster for GPUs without tensor cores or with a thin src0 matrix (particularly KQV in attention)
-        ggml_cuda_mul_mat_vec_f(ctx, src0, src1, nullptr, dst);
-        return;
+    switch (ggml_cuda_select_mul_mat_route(ctx, src0, src1, dst)) {
+        case ggml_cuda_mul_mat_route::CUBLAS:
+            return ggml_cuda_cublas_route_name(ctx, src0, dst);
+        case ggml_cuda_mul_mat_route::MMVF:
+        case ggml_cuda_mul_mat_route::MMVF_TRANSPOSED:
+            return "MMVF";
+        case ggml_cuda_mul_mat_route::MMF:
+            return volta_mma_available(ggml_cuda_info().devices[ctx.device].cc) ? "MMF_VOLTA" : "MMF";
+        case ggml_cuda_mul_mat_route::MMVQ:
+            return "MMVQ";
+        case ggml_cuda_mul_mat_route::MMQ:
+            return "MMQ";
     }
-    // A transposed vector can still use MMVQ (i.e. ne01 == 1)
-    if (ne01 == 1 && ne11 > MMVF_MAX_BATCH_SIZE && ne2 == 1 && ne3 == 1
-            && src0->type == GGML_TYPE_F32
-            && ggml_is_contiguous(src0) && ggml_is_contiguous(src1) && ggml_is_contiguous(dst)
-            && ggml_cuda_should_use_mmvf(src1->type, cc, src1->ne, src1->nb, /*ne11 =*/ 1)) {
-        ggml_tensor dst_vec = *dst;
-        dst_vec.ne[0] = ne11;
-        dst_vec.ne[1] = 1;
-        dst_vec.nb[1] = dst_vec.nb[0]*ne11;
-        dst_vec.nb[2] = dst_vec.nb[1];
-        dst_vec.nb[3] = dst_vec.nb[1];
-        ggml_cuda_mul_mat_vec_f(ctx, src1, src0, nullptr, &dst_vec);
-        return;
-    }
-    if (ggml_cuda_should_use_mmf(src0->type, cc, warp_size, src0->ne, src0->nb, ne11, /*mul_mat_id =*/ false)) {
-        ggml_cuda_mul_mat_f(ctx, src0, src1, nullptr, dst);
-        return;
-    }
-    if (ggml_cuda_should_use_mmvq(src0->type, cc, ne11)) {
-        ggml_cuda_mul_mat_vec_q(ctx, src0, src1, nullptr, dst);
-        return;
-    }
-    if (ggml_cuda_should_use_mmq(src0->type, cc, ne11, /*n_experts =*/ 0)) {
-        ggml_cuda_mul_mat_q(ctx, src0, src1, nullptr, dst);
-        return;
-    }
-    ggml_cuda_mul_mat_cublas(ctx, src0, src1, dst);
+    return "UNKNOWN";
 }
 
 static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
@@ -6085,6 +6176,23 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t 
     GGML_UNUSED(reg);
 }
 
+static const char * ggml_backend_cuda_get_op_route(ggml_backend_t backend, const ggml_tensor * op) {
+    if (!ggml_backend_is_cuda(backend) || op == nullptr) {
+        return "UNKNOWN";
+    }
+
+    ggml_backend_cuda_context * ctx = (ggml_backend_cuda_context *) backend->context;
+    ggml_cuda_set_device(ctx->device);
+    switch (op->op) {
+        case GGML_OP_MUL_MAT:
+            return ggml_cuda_mul_mat_route_name(*ctx, op);
+        case GGML_OP_FLASH_ATTN_EXT:
+            return ggml_cuda_flash_attn_ext_get_route(ctx->device, op);
+        default:
+            return "UNKNOWN";
+    }
+}
+
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
     if (strcmp(name, "ggml_backend_comm_init") == 0) {
@@ -6104,6 +6212,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_get_features") == 0) {
         return (void *)ggml_backend_cuda_get_features;
+    }
+    if (strcmp(name, "ggml_backend_cuda_get_op_route") == 0) {
+        return (void *)ggml_backend_cuda_get_op_route;
     }
     return nullptr;
 }

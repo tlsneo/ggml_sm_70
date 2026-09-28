@@ -5914,6 +5914,22 @@ static ggml_backend_buffer_type_t ggml_backend_cuda_device_get_host_buffer_type(
     return ggml_backend_cuda_host_buffer_type();
 }
 
+static bool ggml_cuda_use_silu_gate_f16_sm70(const int device, const ggml_tensor * op) {
+    const ggml_tensor * gate = op->src[0];
+    const ggml_tensor * up = op->src[1];
+    return ggml_cuda_info().devices[device].cc == GGML_CUDA_CC_VOLTA
+        && op->op == GGML_OP_GLU && ggml_get_glu_op(op) == GGML_GLU_OP_SWIGLU
+        && ggml_get_op_params_i32(op, 1) == 0 && ggml_get_op_params_i32(op, 2) == 1
+        && gate != nullptr && up != nullptr
+        && gate->type == GGML_TYPE_F32 && up->type == GGML_TYPE_F32
+        && op->type == GGML_TYPE_F16
+        && ggml_are_same_shape(gate, up) && ggml_are_same_shape(gate, op)
+        && gate->ne[0] > 0 && ggml_nelements(gate) > 0 && ggml_nelements(gate) <= INT_MAX
+        && gate->nb[0] == sizeof(float) && up->nb[0] == sizeof(float)
+        && ggml_is_contiguous_1(gate) && ggml_is_contiguous_1(up)
+        && ggml_is_contiguous(op);
+}
+
 // TODO: move these functions here
 static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
     ggml_backend_cuda_device_context * dev_ctx = (ggml_backend_cuda_device_context *) dev->context;
@@ -5961,6 +5977,9 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             }
             break;
         case GGML_OP_GLU:
+            if (ggml_get_op_params_i32(op, 2) == 1) {
+                return ggml_cuda_use_silu_gate_f16_sm70(dev_ctx->device, op);
+            }
             switch (ggml_get_glu_op(op)) {
                 case GGML_GLU_OP_REGLU:
                 case GGML_GLU_OP_GEGLU:
@@ -6663,6 +6682,25 @@ static const char * ggml_backend_cuda_get_op_route(ggml_backend_t backend, const
             return ggml_cuda_mul_mat_route_name(*ctx, op);
         case GGML_OP_FLASH_ATTN_EXT:
             return ggml_cuda_flash_attn_ext_get_route(ctx->device, op);
+        case GGML_OP_GLU:
+            if (ggml_get_op_params_i32(op, 2) == 1) {
+                return ggml_cuda_use_silu_gate_f16_sm70(ctx->device, op)
+                    ? "SILU_GATE_F16_SM70"
+                    : "UNSUPPORTED";
+            }
+            return "GLU_CUDA";
+        case GGML_OP_MUL: {
+            const ggml_tensor * unary = op->src[0] != nullptr && op->src[0]->op == GGML_OP_UNARY
+                ? op->src[0]
+                : (op->src[1] != nullptr && op->src[1]->op == GGML_OP_UNARY ? op->src[1] : nullptr);
+            return unary != nullptr && ggml_get_unary_op(unary) == GGML_UNARY_OP_SILU
+                ? "SILU_GATE_F32_FUSED"
+                : "MUL_CUDA";
+        }
+        case GGML_OP_CPY:
+            return op->src[0] != nullptr && op->src[0]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F16
+                ? "CPY_F32_F16"
+                : "CPY_CUDA";
         default:
             return "UNKNOWN";
     }

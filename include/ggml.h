@@ -1356,6 +1356,13 @@ extern "C" {
             struct ggml_tensor  * a,
             struct ggml_tensor  * b);
 
+    // Exact-SM70 preparation path: F32 gate/up inputs, F16 output with
+    // FP16 input, SiLU, and multiply rounding boundaries.
+    GGML_API struct ggml_tensor * ggml_swiglu_split_f16(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * gate,
+            struct ggml_tensor  * up);
+
     GGML_API struct ggml_tensor * ggml_geglu_erf_split(
             struct ggml_context * ctx,
             struct ggml_tensor  * a,

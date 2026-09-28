@@ -284,6 +284,32 @@ static void unary_gated_cuda(const T * x, const T * g, T * dst, const int64_t k,
 }
 
 template <float (*op)(float)>
+static __global__ void unary_gated_f32_to_f16_sm70_kernel(
+        const float * x, const float * g, half * dst,
+        const int64_t k, const int64_t n, const int64_t o0, const int64_t o1) {
+    const int64_t i = int64_t(blockDim.x) * blockIdx.x + threadIdx.x;
+    if (i >= k) {
+        return;
+    }
+    const int64_t j0 = (i / n) * o0 + (i % n);
+    const int64_t j1 = o0 == o1 ? j0 : (i / n) * o1 + (i % n);
+    const half xh = __float2half_rn(x[j0]);
+    const half gh = __float2half_rn(g[j1]);
+    const half activated = __float2half_rn(op(__half2float(xh)));
+    dst[i] = __hmul(activated, gh);
+}
+
+template <float (*op)(float)>
+static void unary_gated_f32_to_f16_sm70_cuda(
+        const float * x, const float * g, half * dst,
+        const int64_t k, const int64_t n, const int64_t o0, const int64_t o1, cudaStream_t stream) {
+    const int64_t blocks = (k + CUDA_GLU_BLOCK_SIZE - 1) / CUDA_GLU_BLOCK_SIZE;
+    unary_gated_f32_to_f16_sm70_kernel<op><<<blocks, CUDA_GLU_BLOCK_SIZE, 0, stream>>>(
+        x, g, dst, k, n, o0, o1);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+template <float (*op)(float)>
 void ggml_cuda_op_unary_gated(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
@@ -301,7 +327,8 @@ void ggml_cuda_op_unary_gated(ggml_backend_cuda_context & ctx, ggml_tensor * dst
 
     GGML_ASSERT(src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16);
     GGML_ASSERT( dst->type == GGML_TYPE_F32 ||  dst->type == GGML_TYPE_F16);
-    GGML_ASSERT(src0->type == dst->type);
+    GGML_ASSERT(src0->type == dst->type ||
+                (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F16));
     GGML_ASSERT(dst->ne[0] == nc);
     GGML_ASSERT(ggml_nrows(dst) == ggml_nrows(src0));
 
@@ -333,7 +360,14 @@ void ggml_cuda_op_unary_gated(ggml_backend_cuda_context & ctx, ggml_tensor * dst
             src1_p += swapped ? 0 : nc;
         }
 
-        unary_gated_cuda<op>(src0_p, src1_p, (float *)dst_d, ggml_nelements(dst), nc, src0_o / sizeof(float), src1_o / sizeof(float), stream);
+        if (dst->type == GGML_TYPE_F16) {
+            unary_gated_f32_to_f16_sm70_cuda<op>(
+                src0_p, src1_p, (half *) dst_d, ggml_nelements(dst), nc,
+                src0_o / sizeof(float), src1_o / sizeof(float), stream);
+        } else {
+            unary_gated_cuda<op>(src0_p, src1_p, (float *)dst_d, ggml_nelements(dst), nc,
+                                 src0_o / sizeof(float), src1_o / sizeof(float), stream);
+        }
     }
 }
 
@@ -346,6 +380,9 @@ void ggml_cuda_op_geglu(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 }
 
 void ggml_cuda_op_swiglu(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    if (dst->type == GGML_TYPE_F16 && dst->src[0]->type == GGML_TYPE_F32) {
+        GGML_ASSERT(ggml_cuda_info().devices[ctx.device].cc == GGML_CUDA_CC_VOLTA);
+    }
     ggml_cuda_op_unary_gated<op_silu>(ctx, dst);
 }
 

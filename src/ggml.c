@@ -3086,6 +3086,25 @@ struct ggml_tensor * ggml_swiglu_split(
     return ggml_glu_impl(ctx, a, b, GGML_GLU_OP_SWIGLU, false);
 }
 
+struct ggml_tensor * ggml_swiglu_split_f16(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * gate,
+        struct ggml_tensor  * up) {
+    GGML_ASSERT(gate->type == GGML_TYPE_F32 && up->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous_1(gate) && ggml_is_contiguous_1(up));
+    GGML_ASSERT(ggml_are_same_shape(gate, up));
+
+    struct ggml_tensor * result = ggml_new_tensor_impl(
+        ctx, GGML_TYPE_F16, GGML_MAX_DIMS, gate->ne, NULL, 0);
+    ggml_set_op_params_i32(result, 0, GGML_GLU_OP_SWIGLU);
+    ggml_set_op_params_i32(result, 1, 0);
+    ggml_set_op_params_i32(result, 2, 1);
+    result->op = GGML_OP_GLU;
+    result->src[0] = gate;
+    result->src[1] = up;
+    return result;
+}
+
 // ggml_geglu_erf
 
 struct ggml_tensor * ggml_geglu_erf(

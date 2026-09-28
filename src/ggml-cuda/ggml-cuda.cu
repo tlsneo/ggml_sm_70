@@ -2465,12 +2465,23 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
 
 enum class ggml_cuda_mul_mat_route {
     CUBLAS,
+    NVFP4_W4A16_CUBLAS,
     MMVF,
     MMVF_TRANSPOSED,
     MMF,
     MMVQ,
     MMQ,
 };
+
+static bool ggml_cuda_use_nvfp4_w4a16_cublas(
+        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
+    const int cc = ggml_cuda_info().devices[ctx.device].cc;
+    return cc == GGML_CUDA_CC_VOLTA
+        && src0->type == GGML_TYPE_NVFP4
+        && src1->type == GGML_TYPE_F32
+        && dst->type == GGML_TYPE_F32
+        && ggml_cuda_mul_mat_cublas_compute_type(ctx, src0, dst) == GGML_TYPE_F16;
+}
 
 static ggml_cuda_mul_mat_route ggml_cuda_select_mul_mat_route(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
@@ -2506,7 +2517,16 @@ static ggml_cuda_mul_mat_route ggml_cuda_select_mul_mat_route(
     if (ggml_cuda_should_use_mmq(src0->type, cc, ne11, /*n_experts =*/ 0)) {
         return ggml_cuda_mul_mat_route::MMQ;
     }
+    if (ggml_cuda_use_nvfp4_w4a16_cublas(ctx, src0, src1, dst)) {
+        return ggml_cuda_mul_mat_route::NVFP4_W4A16_CUBLAS;
+    }
     return ggml_cuda_mul_mat_route::CUBLAS;
+}
+
+static void ggml_cuda_mul_mat_nvfp4_w4a16_cublas(
+        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    GGML_ASSERT(ggml_cuda_use_nvfp4_w4a16_cublas(ctx, src0, src1, dst));
+    ggml_cuda_mul_mat_cublas_impl<GGML_TYPE_F16>(ctx, src0, src1, dst);
 }
 
 static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
@@ -2536,6 +2556,9 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     switch (ggml_cuda_select_mul_mat_route(ctx, src0, src1, dst)) {
         case ggml_cuda_mul_mat_route::CUBLAS:
             ggml_cuda_mul_mat_cublas(ctx, src0, src1, dst);
+            return;
+        case ggml_cuda_mul_mat_route::NVFP4_W4A16_CUBLAS:
+            ggml_cuda_mul_mat_nvfp4_w4a16_cublas(ctx, src0, src1, dst);
             return;
         case ggml_cuda_mul_mat_route::MMVF:
             // The custom F16 vector kernel can be used over batched cuBLAS GEMM.
@@ -2605,6 +2628,8 @@ static const char * ggml_cuda_mul_mat_route_name(ggml_backend_cuda_context & ctx
     switch (ggml_cuda_select_mul_mat_route(ctx, src0, src1, dst)) {
         case ggml_cuda_mul_mat_route::CUBLAS:
             return ggml_cuda_cublas_route_name(ctx, src0, dst);
+        case ggml_cuda_mul_mat_route::NVFP4_W4A16_CUBLAS:
+            return "NVFP4_W4A16_CUBLAS";
         case ggml_cuda_mul_mat_route::MMVF:
         case ggml_cuda_mul_mat_route::MMVF_TRANSPOSED:
             return "MMVF";

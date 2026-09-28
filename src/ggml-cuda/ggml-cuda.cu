@@ -42,6 +42,7 @@
 #include "ggml-cuda/pad.cuh"
 #include "ggml-cuda/pool2d.cuh"
 #include "ggml-cuda/quantize.cuh"
+#include "ggml-cuda/qk-rmsnorm-rope-sm70.cuh"
 #include "ggml-cuda/rope.cuh"
 #include "ggml-cuda/roll.cuh"
 #include "ggml-cuda/scale.cuh"
@@ -82,6 +83,7 @@
 #include <atomic>
 #include <charconv>
 #include <cinttypes>
+#include <cmath>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
@@ -6586,6 +6588,69 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t 
     GGML_UNUSED(reg);
 }
 
+static bool ggml_backend_cuda_qk_rmsnorm_rope_sm70(
+        ggml_backend_t backend,
+        const ggml_tensor * q,
+        const ggml_tensor * k,
+        const ggml_tensor * q_weight,
+        const ggml_tensor * k_weight,
+        const ggml_tensor * rope,
+        ggml_tensor * q_out,
+        ggml_tensor * k_out,
+        float eps) {
+    if (!ggml_backend_is_cuda(backend) || q == nullptr || k == nullptr ||
+        q_weight == nullptr || k_weight == nullptr || rope == nullptr ||
+        q_out == nullptr || k_out == nullptr) {
+        return false;
+    }
+    auto * ctx = static_cast<ggml_backend_cuda_context *>(backend->context);
+    if (ggml_cuda_info().devices[ctx->device].cc != GGML_CUDA_CC_VOLTA ||
+        q->type != GGML_TYPE_F32 || k->type != GGML_TYPE_F32 ||
+        q_weight->type != GGML_TYPE_F32 || k_weight->type != GGML_TYPE_F32 ||
+        rope->type != GGML_TYPE_F32 || q_out->type != GGML_TYPE_F16 || k_out->type != GGML_TYPE_F16 ||
+        !ggml_are_same_shape(q, k) || q->ne[0] != 128 ||
+        q->ne[1] <= 0 || q->ne[2] <= 0 || q->ne[3] <= 0 ||
+        !ggml_is_contiguous_rows(q) || !ggml_is_contiguous_rows(k) ||
+        ggml_nelements(q_weight) != 128 || ggml_nelements(k_weight) != 128 ||
+        !ggml_is_contiguous(q_weight) || !ggml_is_contiguous(k_weight) ||
+        !ggml_is_contiguous(rope) || rope->ne[0] != 2 || rope->ne[1] != 2 ||
+        (rope->ne[2] != 48 && rope->ne[2] != 64) || rope->ne[3] != q->ne[2] ||
+        q_out->ne[0] != 128 || q_out->ne[1] != q->ne[2] ||
+        q_out->ne[2] != q->ne[1] || q_out->ne[3] != q->ne[3] ||
+        !ggml_are_same_shape(q_out, k_out) || !ggml_is_contiguous(q_out) || !ggml_is_contiguous(k_out) ||
+        !std::isfinite(eps) || eps <= 0.0f) {
+        return false;
+    }
+
+    ggml_cuda_set_device(ctx->device);
+    const ggml_cuda_qk_rmsnorm_rope_sm70_params params{
+        static_cast<const float *>(q->data),
+        static_cast<const float *>(k->data),
+        nullptr,
+        static_cast<const float *>(q_weight->data),
+        static_cast<const float *>(k_weight->data),
+        static_cast<const float *>(rope->data),
+        static_cast<half *>(q_out->data),
+        static_cast<half *>(k_out->data),
+        nullptr,
+        {static_cast<int64_t>(q->nb[1] / sizeof(float)),
+         static_cast<int64_t>(q->nb[2] / sizeof(float)),
+         static_cast<int64_t>(q->nb[3] / sizeof(float))},
+        {static_cast<int64_t>(k->nb[1] / sizeof(float)),
+         static_cast<int64_t>(k->nb[2] / sizeof(float)),
+         static_cast<int64_t>(k->nb[3] / sizeof(float))},
+        {0, 0, 0},
+        q->ne[1],
+        q->ne[2],
+        q->ne[3],
+        static_cast<int32_t>(rope->ne[2] * 2),
+        eps,
+        1.0f,
+    };
+    ggml_cuda_qk_rmsnorm_rope_sm70(params, ctx->stream());
+    return true;
+}
+
 static const char * ggml_backend_cuda_get_op_route(ggml_backend_t backend, const ggml_tensor * op) {
     if (!ggml_backend_is_cuda(backend) || op == nullptr) {
         return "UNKNOWN";
@@ -6625,6 +6690,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_cuda_get_op_route") == 0) {
         return (void *)ggml_backend_cuda_get_op_route;
+    }
+    if (strcmp(name, "ggml_backend_cuda_qk_rmsnorm_rope_sm70") == 0) {
+        return (void *)ggml_backend_cuda_qk_rmsnorm_rope_sm70;
     }
     return nullptr;
 }

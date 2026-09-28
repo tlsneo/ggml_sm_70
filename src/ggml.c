@@ -5536,6 +5536,50 @@ struct ggml_tensor * ggml_flash_attn_ext(
     return result;
 }
 
+struct ggml_tensor * ggml_flash_attn_ext_qk_rms_norm_rope(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * v,
+        struct ggml_tensor  * q_weight,
+        struct ggml_tensor  * k_weight,
+        struct ggml_tensor  * rope,
+        float                 scale,
+        float                 kv_scale,
+        float                 eps) {
+    GGML_ASSERT(q != NULL && k != NULL && v != NULL);
+    GGML_ASSERT(q_weight != NULL && k_weight != NULL && rope != NULL);
+    GGML_ASSERT(q->type == GGML_TYPE_F32 && k->type == GGML_TYPE_F32 && v->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_are_same_shape(q, k) && ggml_are_same_shape(q, v));
+    GGML_ASSERT(q->ne[0] == 128 && q->ne[1] > 0 && q->ne[2] > 0 && q->ne[3] > 0);
+    GGML_ASSERT(ggml_is_contiguous_rows(q) && ggml_is_contiguous_rows(k) && ggml_is_contiguous_rows(v));
+    GGML_ASSERT(q_weight->type == GGML_TYPE_F32 && k_weight->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_nelements(q_weight) == 128 && ggml_nelements(k_weight) == 128);
+    GGML_ASSERT(ggml_is_contiguous(q_weight) && ggml_is_contiguous(k_weight));
+    GGML_ASSERT(rope->type == GGML_TYPE_F32 && ggml_is_contiguous(rope));
+    GGML_ASSERT(rope->ne[0] == 2 && rope->ne[1] == 2);
+    GGML_ASSERT((rope->ne[2] == 48 || rope->ne[2] == 64) && rope->ne[3] == q->ne[2]);
+    GGML_ASSERT(isfinite(scale) && scale > 0.0f);
+    GGML_ASSERT(isfinite(kv_scale) && kv_scale > 0.0f);
+    GGML_ASSERT(isfinite(eps) && eps > 0.0f);
+
+    struct ggml_tensor * result = ggml_new_tensor_4d(
+        ctx, GGML_TYPE_F32, q->ne[0], q->ne[1], q->ne[2], q->ne[3]);
+    const float params[] = { scale, 0.0f, 0.0f };
+    ggml_set_op_params(result, params, sizeof(params));
+    result->op     = GGML_OP_FLASH_ATTN_EXT;
+    result->src[0] = q;
+    result->src[1] = k;
+    result->src[2] = v;
+    result->src[5] = q_weight;
+    result->src[6] = k_weight;
+    result->src[7] = rope;
+    ggml_flash_attn_ext_set_prec(result, GGML_PREC_F32);
+    ggml_set_op_params_f32(result, 4, eps);
+    ggml_set_op_params_f32(result, 5, kv_scale);
+    return result;
+}
+
 
 struct ggml_tensor * ggml_sage_attn(
         struct ggml_context * ctx,

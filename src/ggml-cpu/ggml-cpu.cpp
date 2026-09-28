@@ -421,7 +421,8 @@ static ggml_backend_buffer_t ggml_backend_cpu_device_buffer_from_host_ptr(ggml_b
 }
 
 static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
-    if (op->op == GGML_OP_SAGE_ATTN || op->op == GGML_OP_SOL_ATTN) {
+    if (op->op == GGML_OP_SAGE_ATTN || op->op == GGML_OP_SOL_ATTN ||
+        (op->op == GGML_OP_FLASH_ATTN_EXT && op->src[5] != nullptr)) {
         return false;
     }
     const struct ggml_tensor * src0 = op->src[0];

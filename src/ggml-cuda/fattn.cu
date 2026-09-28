@@ -4,6 +4,7 @@
 #include "fattn-tile.cuh"
 #include "fattn-vec.cuh"
 #include "fattn.cuh"
+#include "qk-rmsnorm-rope-sm70.cuh"
 #ifdef GGML_CUDA_CUTLASS_SM70_ATTN
 #include "vendors/cutlass-sm70-attention/ggml-cutlass-sm70-attention.cuh"
 #endif
@@ -345,9 +346,10 @@ enum best_fattn_kernel {
     BEST_FATTN_KERNEL_NONE          =   0,
     BEST_FATTN_KERNEL_TILE          = 200,
     BEST_FATTN_KERNEL_VEC           = 100,
-    BEST_FATTN_KERNEL_MMA_F16       = 400,
-    BEST_FATTN_KERNEL_CUTLASS_SM70    = 500,
-    BEST_FATTN_KERNEL_FLASHINFER_SM70 = 600,
+    BEST_FATTN_KERNEL_MMA_F16                   = 400,
+    BEST_FATTN_KERNEL_CUTLASS_SM70              = 500,
+    BEST_FATTN_KERNEL_FLASHINFER_SM70           = 600,
+    BEST_FATTN_KERNEL_QK_RMSNORM_ROPE_SM70      = 700,
 };
 
 enum class ggml_cuda_sm70_attention_mode {
@@ -438,6 +440,63 @@ static bool ggml_cuda_fattn_kv_type_supported(ggml_type type) {
     }
 }
 
+static bool ggml_cuda_is_qk_rmsnorm_rope_attention(const ggml_tensor * dst) {
+    return dst->src[5] != nullptr || dst->src[6] != nullptr || dst->src[7] != nullptr;
+}
+
+static bool ggml_cuda_use_qk_rmsnorm_rope_sm70(const int device, const ggml_tensor * dst) {
+#ifdef GGML_CUDA_CUTLASS_SM70_ATTN
+    const ggml_tensor * Q = dst->src[0];
+    const ggml_tensor * K = dst->src[1];
+    const ggml_tensor * V = dst->src[2];
+    const ggml_tensor * q_weight = dst->src[5];
+    const ggml_tensor * k_weight = dst->src[6];
+    const ggml_tensor * rope = dst->src[7];
+    float scale = 0.0f;
+    float max_bias = 0.0f;
+    float logit_softcap = 0.0f;
+    const float eps = ggml_get_op_params_f32(dst, 4);
+    const float kv_scale = ggml_get_op_params_f32(dst, 5);
+    memcpy(&scale, (const float *) dst->op_params + 0, sizeof(scale));
+    memcpy(&max_bias, (const float *) dst->op_params + 1, sizeof(max_bias));
+    memcpy(&logit_softcap, (const float *) dst->op_params + 2, sizeof(logit_softcap));
+
+    return ggml_cuda_info().devices[device].cc == GGML_CUDA_CC_VOLTA
+        && Q != nullptr && K != nullptr && V != nullptr
+        && q_weight != nullptr && k_weight != nullptr && rope != nullptr
+        && dst->src[3] == nullptr && dst->src[4] == nullptr
+        && Q->type == GGML_TYPE_F32 && K->type == GGML_TYPE_F32 && V->type == GGML_TYPE_F32
+        && q_weight->type == GGML_TYPE_F32 && k_weight->type == GGML_TYPE_F32
+        && rope->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32
+        && ggml_flash_attn_ext_get_prec(dst) == GGML_PREC_F32
+        && Q->ne[0] == 128 && ggml_are_same_shape(Q, K) && ggml_are_same_shape(Q, V)
+        && Q->ne[1] > 0 && Q->ne[2] > 0 && Q->ne[3] > 0
+        && ggml_is_contiguous_rows(Q) && ggml_is_contiguous_rows(K) && ggml_is_contiguous_rows(V)
+        && Q->nb[0] == sizeof(float) && K->nb[0] == sizeof(float) && V->nb[0] == sizeof(float)
+        && Q->nb[1] % sizeof(float) == 0 && Q->nb[2] % sizeof(float) == 0 && Q->nb[3] % sizeof(float) == 0
+        && K->nb[1] % sizeof(float) == 0 && K->nb[2] % sizeof(float) == 0 && K->nb[3] % sizeof(float) == 0
+        && V->nb[1] % sizeof(float) == 0 && V->nb[2] % sizeof(float) == 0 && V->nb[3] % sizeof(float) == 0
+        && ggml_nelements(q_weight) == 128 && ggml_nelements(k_weight) == 128
+        && ggml_is_contiguous(q_weight) && ggml_is_contiguous(k_weight)
+        && ggml_is_contiguous(rope) && rope->ne[0] == 2 && rope->ne[1] == 2
+        && (rope->ne[2] == 48 || rope->ne[2] == 64) && rope->ne[3] == Q->ne[2]
+        && dst->ne[0] == 128 && dst->ne[1] == Q->ne[1]
+        && dst->ne[2] == Q->ne[2] && dst->ne[3] == Q->ne[3]
+        && ggml_is_contiguous(dst)
+        && Q->ne[2] <= INT_MAX && Q->ne[1] * Q->ne[3] <= 65535
+        && Q->ne[1] * 128 <= INT_MAX
+        && std::isfinite(scale) && scale > 0.0f
+        && std::isfinite(kv_scale) && kv_scale > 0.0f
+        && std::isfinite(scale / kv_scale) && scale / kv_scale > 0.0f
+        && std::isfinite(eps) && eps > 0.0f
+        && max_bias == 0.0f && logit_softcap == 0.0f;
+#else
+    GGML_UNUSED(device);
+    GGML_UNUSED(dst);
+    return false;
+#endif
+}
+
 #if defined(GGML_CUDA_CUTLASS_SM70_ATTN) || defined(GGML_CUDA_FLASHINFER_SM70_ATTN)
 static bool ggml_cuda_use_sm70_d128_attention_common(const int device, const ggml_tensor * dst) {
     const ggml_tensor * Q = dst->src[0];
@@ -502,6 +561,88 @@ static bool ggml_cuda_use_flashinfer_sm70_attention(const int device, const ggml
 }
 
 #ifdef GGML_CUDA_CUTLASS_SM70_ATTN
+static void ggml_cuda_flash_attn_ext_qk_rmsnorm_rope_sm70(
+        ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    GGML_ASSERT(ggml_cuda_use_qk_rmsnorm_rope_sm70(ctx.device, dst));
+    const ggml_tensor * Q = dst->src[0];
+    const ggml_tensor * K = dst->src[1];
+    const ggml_tensor * V = dst->src[2];
+    const ggml_tensor * q_weight = dst->src[5];
+    const ggml_tensor * k_weight = dst->src[6];
+    const ggml_tensor * rope = dst->src[7];
+    const int64_t heads = Q->ne[1];
+    const int64_t tokens = Q->ne[2];
+    const int64_t batches = Q->ne[3];
+    const int64_t elements = 128 * heads * tokens * batches;
+    const cudaStream_t stream = ctx.stream();
+
+    ggml_cuda_pool_alloc<half> q_f16(ctx.pool(), elements);
+    ggml_cuda_pool_alloc<half> k_f16(ctx.pool(), elements);
+    ggml_cuda_pool_alloc<half> v_f16(ctx.pool(), elements);
+    ggml_cuda_pool_alloc<half> output_f16(ctx.pool(), elements);
+
+    const float eps = ggml_get_op_params_f32(dst, 4);
+    const float kv_scale = ggml_get_op_params_f32(dst, 5);
+    const ggml_cuda_qk_rmsnorm_rope_sm70_params prep{
+        static_cast<const float *>(Q->data),
+        static_cast<const float *>(K->data),
+        static_cast<const float *>(V->data),
+        static_cast<const float *>(q_weight->data),
+        static_cast<const float *>(k_weight->data),
+        static_cast<const float *>(rope->data),
+        q_f16.get(),
+        k_f16.get(),
+        v_f16.get(),
+        {static_cast<int64_t>(Q->nb[1] / sizeof(float)),
+         static_cast<int64_t>(Q->nb[2] / sizeof(float)),
+         static_cast<int64_t>(Q->nb[3] / sizeof(float))},
+        {static_cast<int64_t>(K->nb[1] / sizeof(float)),
+         static_cast<int64_t>(K->nb[2] / sizeof(float)),
+         static_cast<int64_t>(K->nb[3] / sizeof(float))},
+        {static_cast<int64_t>(V->nb[1] / sizeof(float)),
+         static_cast<int64_t>(V->nb[2] / sizeof(float)),
+         static_cast<int64_t>(V->nb[3] / sizeof(float))},
+        heads,
+        tokens,
+        batches,
+        static_cast<int32_t>(rope->ne[2] * 2),
+        eps,
+        kv_scale,
+    };
+    ggml_cuda_qk_rmsnorm_rope_sm70(prep, stream);
+
+    float scale = 0.0f;
+    memcpy(&scale, (const float *) dst->op_params, sizeof(scale));
+    const ggml_cuda_cutlass_sm70_attention_params params{
+        q_f16.get(),
+        k_f16.get(),
+        v_f16.get(),
+        output_f16.get(),
+        static_cast<int>(tokens),
+        static_cast<int>(tokens),
+        static_cast<int>(heads),
+        static_cast<int>(batches),
+        scale / kv_scale,
+        ggml_cuda_get_sm70_attention_query_tile(),
+        ggml_cuda_get_sm70_attention_key_tile(),
+        128,
+        tokens * 128,
+        heads * tokens * 128,
+        128,
+        tokens * 128,
+        heads * tokens * 128,
+        128,
+        tokens * 128,
+        heads * tokens * 128,
+        heads * 128,
+        128,
+        tokens * heads * 128,
+    };
+    ggml_cuda_cutlass_sm70_attention(params, stream);
+    ggml_cuda_qk_rmsnorm_rope_sm70_restore_output(
+        output_f16.get(), static_cast<float *>(dst->data), elements, 1.0f / kv_scale, stream);
+}
+
 static void ggml_cuda_flash_attn_ext_cutlass_sm70(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     GGML_ASSERT(ggml_cuda_use_cutlass_sm70_attention(ctx.device, dst));
     const ggml_tensor * Q = dst->src[0];
@@ -604,6 +745,15 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     const ggml_tensor * K     = dst->src[1];
     const ggml_tensor * V     = dst->src[2];
     const ggml_tensor * mask  = dst->src[3];
+
+    if (ggml_cuda_is_qk_rmsnorm_rope_attention(dst)) {
+        const auto mode = ggml_cuda_get_sm70_attention_mode();
+        return (mode == ggml_cuda_sm70_attention_mode::AUTO ||
+                mode == ggml_cuda_sm70_attention_mode::CUTLASS) &&
+               ggml_cuda_use_qk_rmsnorm_rope_sm70(device, dst)
+            ? BEST_FATTN_KERNEL_QK_RMSNORM_ROPE_SM70
+            : BEST_FATTN_KERNEL_NONE;
+    }
 
     if (ggml_cuda_get_sm70_attention_mode() == ggml_cuda_sm70_attention_mode::CUTLASS) {
         return ggml_cuda_use_cutlass_sm70_attention(device, dst)
@@ -803,6 +953,8 @@ const char * ggml_cuda_flash_attn_ext_get_route(int device, const ggml_tensor * 
             return "FATTN_CUTLASS_SM70";
         case BEST_FATTN_KERNEL_FLASHINFER_SM70:
             return "FATTN_FLASHINFER_SM70";
+        case BEST_FATTN_KERNEL_QK_RMSNORM_ROPE_SM70:
+            return "QK_RMSNORM_ROPE_SM70";
     }
     return "UNKNOWN";
 }
@@ -833,6 +985,7 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
             break;
         case BEST_FATTN_KERNEL_CUTLASS_SM70:
         case BEST_FATTN_KERNEL_FLASHINFER_SM70:
+        case BEST_FATTN_KERNEL_QK_RMSNORM_ROPE_SM70:
             break;
         case BEST_FATTN_KERNEL_NONE:
             break;
@@ -871,6 +1024,13 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
             break;
 #else
             GGML_ABORT("SM70 FlashInfer attention backend was not built");
+#endif
+        case BEST_FATTN_KERNEL_QK_RMSNORM_ROPE_SM70:
+#ifdef GGML_CUDA_CUTLASS_SM70_ATTN
+            ggml_cuda_flash_attn_ext_qk_rmsnorm_rope_sm70(ctx, dst);
+            break;
+#else
+            GGML_ABORT("SM70 Q/K RMSNorm+RoPE backend was not built");
 #endif
     }
 }

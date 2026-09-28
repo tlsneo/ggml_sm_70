@@ -2446,6 +2446,21 @@ extern "C" {
             float                 max_bias,
             float                 logit_softcap);
 
+    // Fused exact-SM70 D128 path. Q/K/V are strided F32 [D, heads, tokens, batch],
+    // weights are contiguous F32 [D], and rope is contiguous F32 [2, 2, rot_dim/2, tokens].
+    // The result has the regular FLASH_ATTN_EXT layout [D, heads, tokens, batch].
+    GGML_API struct ggml_tensor * ggml_flash_attn_ext_qk_rms_norm_rope(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * v,
+            struct ggml_tensor  * q_weight,
+            struct ggml_tensor  * k_weight,
+            struct ggml_tensor  * rope,
+            float                 scale,
+            float                 kv_scale,
+            float                 eps);
+
     enum ggml_sage_attn_mode {
         GGML_SAGE_ATTN_AUTO = 0,
         GGML_SAGE_ATTN_2,

@@ -2,6 +2,9 @@ cmake_minimum_required(VERSION 3.18)  # for CMAKE_CUDA_ARCHITECTURES
 
 find_package(CUDAToolkit)
 
+option(GGML_CUDA_TURBOMIND_SM70 "Build the experimental exact-SM70 TurboMind NVFP4 backend" OFF)
+set(GGML_CUDA_CUTLASS_PATH "" CACHE PATH "CUTLASS source root used by the SM70 TurboMind backend")
+
 if (CUDAToolkit_FOUND)
     message(STATUS "CUDA Toolkit found")
 
@@ -124,10 +127,55 @@ if (CUDAToolkit_FOUND)
             template-instances/fattn-vec-instance-bf16-bf16.cu)
     endif()
 
+    if (GGML_CUDA_TURBOMIND_SM70)
+        if (NOT EXISTS "${GGML_CUDA_CUTLASS_PATH}/include/cutlass/cutlass.h")
+            message(FATAL_ERROR "GGML_CUDA_TURBOMIND_SM70 requires GGML_CUDA_CUTLASS_PATH pointing to CUTLASS v4.4.2")
+        endif()
+
+        set(GGML_CUDA_TURBOMIND_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/vendors/turbomind-sm70")
+        set(GGML_CUDA_TURBOMIND_VENDOR "${GGML_CUDA_TURBOMIND_ROOT}/lmdeploy")
+        set(GGML_CUDA_TURBOMIND_CUDA_SRCS
+            ${GGML_CUDA_TURBOMIND_VENDOR}/src/turbomind/kernels/gemm/gemm.cu
+            ${GGML_CUDA_TURBOMIND_VENDOR}/src/turbomind/kernels/gemm/kernel.cu
+            ${GGML_CUDA_TURBOMIND_VENDOR}/src/turbomind/kernels/gemm/dispatch_cache.cu
+            ${GGML_CUDA_TURBOMIND_VENDOR}/src/turbomind/kernels/gemm/context.cu
+            ${GGML_CUDA_TURBOMIND_VENDOR}/src/turbomind/kernels/gemm/convert_v3.cu
+            ${GGML_CUDA_TURBOMIND_VENDOR}/src/turbomind/kernels/gemm/cast.cu
+            ${GGML_CUDA_TURBOMIND_VENDOR}/src/turbomind/kernels/gemm/unpack.cu
+            ${GGML_CUDA_TURBOMIND_VENDOR}/src/turbomind/kernels/gemm/tuner/cache_utils.cu
+            ${GGML_CUDA_TURBOMIND_VENDOR}/src/turbomind/kernels/gemm/tuner/measurer.cu
+            ${GGML_CUDA_TURBOMIND_VENDOR}/src/turbomind/kernels/gemm/tuner/sampler.cu
+            ${GGML_CUDA_TURBOMIND_ROOT}/sm70-nvfp4-f32.cu
+            ${GGML_CUDA_TURBOMIND_ROOT}/registry-sm70.cu
+            ${GGML_CUDA_TURBOMIND_ROOT}/ggml-nvfp4-turbomind.cu)
+        set(GGML_CUDA_TURBOMIND_CXX_SRCS
+            ${GGML_CUDA_TURBOMIND_VENDOR}/src/turbomind/core/check.cc
+            ${GGML_CUDA_TURBOMIND_VENDOR}/src/turbomind/core/layout.cc
+            ${GGML_CUDA_TURBOMIND_VENDOR}/src/turbomind/core/context.cc
+            ${GGML_CUDA_TURBOMIND_VENDOR}/src/turbomind/core/allocator.cc
+            ${GGML_CUDA_TURBOMIND_VENDOR}/src/turbomind/core/buffer.cc
+            ${GGML_CUDA_TURBOMIND_VENDOR}/src/turbomind/core/stream.cc
+            ${GGML_CUDA_TURBOMIND_VENDOR}/src/turbomind/utils/logger.cc
+            ${GGML_CUDA_TURBOMIND_VENDOR}/src/turbomind/utils/parser.cc
+            ${GGML_CUDA_TURBOMIND_VENDOR}/src/turbomind/kernels/gemm/tuner/stopping_criterion.cc
+            ${GGML_CUDA_TURBOMIND_VENDOR}/src/turbomind/kernels/gemm/tuner/params.cc)
+        list(APPEND GGML_SOURCES_CUDA ${GGML_CUDA_TURBOMIND_CUDA_SRCS} ${GGML_CUDA_TURBOMIND_CXX_SRCS})
+        set_source_files_properties(${GGML_CUDA_TURBOMIND_CUDA_SRCS} PROPERTIES CUDA_ARCHITECTURES 70)
+    endif()
+
     ggml_add_backend_library(ggml-cuda
                              ${GGML_HEADERS_CUDA}
                              ${GGML_SOURCES_CUDA}
                             )
+
+    if (GGML_CUDA_TURBOMIND_SM70)
+        target_include_directories(ggml-cuda PRIVATE
+            ${GGML_CUDA_TURBOMIND_ROOT}
+            ${GGML_CUDA_TURBOMIND_VENDOR}
+            ${GGML_CUDA_CUTLASS_PATH}/include)
+        target_compile_definitions(ggml-cuda PRIVATE GGML_CUDA_TURBOMIND_SM70=1 ENABLE_BF16=0)
+        target_compile_options(ggml-cuda PRIVATE "$<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>")
+    endif()
 
     if (CUDAToolkit_VERSION VERSION_GREATER_EQUAL "11.8")
         target_compile_definitions(ggml-cuda PRIVATE GGML_CUDA_USE_CUBLASLT_FP8)

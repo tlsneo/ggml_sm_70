@@ -46,6 +46,9 @@
 #include "ggml-cuda/roll.cuh"
 #include "ggml-cuda/scale.cuh"
 #include "ggml-cuda/sm70-w8a16.cuh"
+#ifdef GGML_CUDA_TURBOMIND_SM70
+#include "ggml-cuda/vendors/turbomind-sm70/ggml-nvfp4-turbomind.cuh"
+#endif
 #include "ggml-cuda/snake.cuh"
 #include "ggml-cuda/softcap.cuh"
 #include "ggml-cuda/softmax.cuh"
@@ -91,6 +94,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 static_assert(sizeof(half) == sizeof(ggml_fp16_t), "wrong fp16 size");
@@ -703,9 +707,74 @@ static std::mutex ggml_cuda_lock;
 static std::condition_variable ggml_cuda_lock_cv;
 static std::atomic<int> ggml_cuda_lock_counter;
 
+#ifdef GGML_CUDA_TURBOMIND_SM70
+static size_t ggml_cuda_nvfp4_turbomind_cache_limit() {
+    static const size_t limit = [] {
+        const char * value = std::getenv("GGML_CUDA_TURBOMIND_CACHE_MIB");
+        if (value == nullptr) {
+            return size_t(512) << 20;
+        }
+        char * end = nullptr;
+        const unsigned long long mib = std::strtoull(value, &end, 10);
+        if (end == value || *end != 0 || mib == 0 || mib > (SIZE_MAX >> 20)) {
+            GGML_ABORT("GGML_CUDA_TURBOMIND_CACHE_MIB must be a positive integer");
+        }
+        return size_t(mib) << 20;
+    }();
+    return limit;
+}
+
+struct ggml_cuda_nvfp4_turbomind_workspace {
+    ggml_cuda_pool_alloc<uint8_t> barriers;
+    ggml_cuda_pool_alloc<uint8_t> partials;
+    ggml_cuda_pool_alloc<uint8_t> tensormaps;
+    ggml_cuda_pool_alloc<int> flags;
+
+    ggml_cuda_nvfp4_turbomind_workspace(ggml_cuda_pool & pool, cudaStream_t stream)
+        : barriers(pool, ggml_cuda_nvfp4_turbomind_barriers_size()),
+          partials(pool, ggml_cuda_nvfp4_turbomind_partials_size()),
+          tensormaps(pool, ggml_cuda_nvfp4_turbomind_tensormaps_size()),
+          flags(pool, 1) {
+        CUDA_CHECK(cudaMemsetAsync(barriers.get(), 0, ggml_cuda_nvfp4_turbomind_barriers_size(), stream));
+        CUDA_CHECK(cudaMemsetAsync(partials.get(), 0, ggml_cuda_nvfp4_turbomind_partials_size(), stream));
+        CUDA_CHECK(cudaMemsetAsync(flags.get(), 0, sizeof(int), stream));
+    }
+};
+
+static std::mutex ggml_cuda_nvfp4_turbomind_workspace_mutex;
+static std::map<std::pair<ggml_backend_cuda_context *, int>,
+                std::unique_ptr<ggml_cuda_nvfp4_turbomind_workspace>> ggml_cuda_nvfp4_turbomind_workspaces;
+
+static ggml_cuda_nvfp4_turbomind_workspace & ggml_cuda_get_nvfp4_turbomind_workspace(
+        ggml_backend_cuda_context & ctx) {
+    std::lock_guard<std::mutex> lock(ggml_cuda_nvfp4_turbomind_workspace_mutex);
+    const auto key = std::make_pair(&ctx, ctx.curr_stream_no);
+    auto & workspace = ggml_cuda_nvfp4_turbomind_workspaces[key];
+    if (!workspace) {
+        workspace = std::make_unique<ggml_cuda_nvfp4_turbomind_workspace>(ctx.pool(), ctx.stream());
+    }
+    return *workspace;
+}
+
+static void ggml_cuda_release_nvfp4_turbomind_workspaces(ggml_backend_cuda_context * ctx) {
+    std::lock_guard<std::mutex> lock(ggml_cuda_nvfp4_turbomind_workspace_mutex);
+    for (auto it = ggml_cuda_nvfp4_turbomind_workspaces.begin(); it != ggml_cuda_nvfp4_turbomind_workspaces.end();) {
+        if (it->first.first == ctx) {
+            it = ggml_cuda_nvfp4_turbomind_workspaces.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+#endif
+
 ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     std::unique_lock<std::mutex> lock(ggml_cuda_lock);
     ggml_cuda_lock_cv.wait(lock, []{ return ggml_cuda_lock_counter.load(std::memory_order_relaxed) == 0; });
+
+#ifdef GGML_CUDA_TURBOMIND_SM70
+    ggml_cuda_release_nvfp4_turbomind_workspaces(this);
+#endif
 
     if (copy_event != nullptr) {
         CUDA_CHECK(cudaEventDestroy(copy_event));
@@ -734,13 +803,38 @@ struct ggml_backend_cuda_buffer_context {
     int device;
     void * dev_ptr = nullptr;
     std::string name;
+#ifdef GGML_CUDA_TURBOMIND_SM70
+    struct nvfp4_turbomind_cache_entry {
+        std::unique_ptr<ggml_cuda_nvfp4_turbomind_prepared> prepared;
+        uint64_t last_use = 0;
+    };
+
+    std::mutex nvfp4_turbomind_mutex;
+    std::unordered_map<const void *, nvfp4_turbomind_cache_entry> nvfp4_turbomind_cache;
+    size_t nvfp4_turbomind_cache_bytes = 0;
+    uint64_t nvfp4_turbomind_cache_clock = 0;
+#endif
 
     ggml_backend_cuda_buffer_context(int device, void * dev_ptr) :
         device(device), dev_ptr(dev_ptr),
         name(GGML_CUDA_NAME + std::to_string(device)) {
     }
 
+#ifdef GGML_CUDA_TURBOMIND_SM70
+    void clear_nvfp4_turbomind_cache() {
+        std::lock_guard<std::mutex> lock(nvfp4_turbomind_mutex);
+        for (auto & item : nvfp4_turbomind_cache) {
+            ggml_cuda_nvfp4_turbomind_release(item.second.prepared.get());
+        }
+        nvfp4_turbomind_cache.clear();
+        nvfp4_turbomind_cache_bytes = 0;
+    }
+#endif
+
     ~ggml_backend_cuda_buffer_context() {
+#ifdef GGML_CUDA_TURBOMIND_SM70
+        clear_nvfp4_turbomind_cache();
+#endif
         CUDA_CHECK(cudaFree(dev_ptr));
     }
 };
@@ -782,6 +876,9 @@ static enum ggml_status ggml_backend_cuda_buffer_init_tensor(ggml_backend_buffer
 
 static void ggml_backend_cuda_buffer_memset_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, uint8_t value, size_t offset, size_t size) {
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
+#ifdef GGML_CUDA_TURBOMIND_SM70
+    ctx->clear_nvfp4_turbomind_cache();
+#endif
 
     ggml_cuda_set_device(ctx->device);
     CUDA_CHECK(cudaMemsetAsync((char *) tensor->data + offset, value, size, cudaStreamPerThread));
@@ -790,6 +887,9 @@ static void ggml_backend_cuda_buffer_memset_tensor(ggml_backend_buffer_t buffer,
 
 static void ggml_backend_cuda_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
+#ifdef GGML_CUDA_TURBOMIND_SM70
+    ctx->clear_nvfp4_turbomind_cache();
+#endif
 
     ggml_cuda_set_device(ctx->device);
     CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cudaStreamPerThread));
@@ -807,6 +907,9 @@ static void ggml_backend_cuda_buffer_get_tensor(ggml_backend_buffer_t buffer, co
 static void ggml_backend_cuda_buffer_set_tensor_2d(ggml_backend_buffer_t buffer, struct ggml_tensor * tensor, const void * data,
         size_t offset, size_t size, size_t n_copies, size_t stride_tensor, size_t stride_data) {
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
+#ifdef GGML_CUDA_TURBOMIND_SM70
+    ctx->clear_nvfp4_turbomind_cache();
+#endif
 
     ggml_cuda_set_device(ctx->device);
     CUDA_CHECK(cudaMemcpy2DAsync(
@@ -828,6 +931,9 @@ static bool ggml_backend_cuda_buffer_cpy_tensor(ggml_backend_buffer_t buffer, co
     if (ggml_backend_buffer_is_cuda(src->buffer)) {
         ggml_backend_cuda_buffer_context * src_ctx = (ggml_backend_cuda_buffer_context *)src->buffer->context;
         ggml_backend_cuda_buffer_context * dst_ctx = (ggml_backend_cuda_buffer_context *)dst->buffer->context;
+#ifdef GGML_CUDA_TURBOMIND_SM70
+        dst_ctx->clear_nvfp4_turbomind_cache();
+#endif
         // compare the backing physical devices: distinct virtual devices may share one physical GPU,
         // in which case a same-device copy (not a peer copy) is required
         const int src_physical = ggml_cuda_get_physical_device(src_ctx->device);
@@ -851,6 +957,9 @@ static bool ggml_backend_cuda_buffer_cpy_tensor(ggml_backend_buffer_t buffer, co
 
 static void ggml_backend_cuda_buffer_clear(ggml_backend_buffer_t buffer, uint8_t value) {
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *)buffer->context;
+#ifdef GGML_CUDA_TURBOMIND_SM70
+    ctx->clear_nvfp4_turbomind_cache();
+#endif
 
     ggml_cuda_set_device(ctx->device);
     CUDA_CHECK(cudaMemsetAsync(ctx->dev_ptr, value, buffer->size, cudaStreamPerThread));
@@ -2467,6 +2576,7 @@ enum class ggml_cuda_mul_mat_route {
     CUBLAS,
     NVFP4_W4A16_CUBLAS,
     NVFP4_W4A16_CUBLAS_CHUNKED,
+    NVFP4_W4A16_TURBOMIND_SM70,
     NVFP4_W4A16_UNSUPPORTED,
     MMVF,
     MMVF_TRANSPOSED,
@@ -2479,6 +2589,7 @@ enum class ggml_cuda_nvfp4_w4a16_mode {
     AUTO,
     CUBLAS,
     CHUNKED,
+    TURBOMIND,
 };
 
 static ggml_cuda_nvfp4_w4a16_mode ggml_cuda_get_nvfp4_w4a16_mode() {
@@ -2500,7 +2611,10 @@ static ggml_cuda_nvfp4_w4a16_mode ggml_cuda_get_nvfp4_w4a16_mode() {
         if (value == "chunked") {
             return ggml_cuda_nvfp4_w4a16_mode::CHUNKED;
         }
-        GGML_ABORT("GGML_CUDA_NVFP4_W4A16 must be auto, cublas, or chunked");
+        if (value == "turbomind") {
+            return ggml_cuda_nvfp4_w4a16_mode::TURBOMIND;
+        }
+        GGML_ABORT("GGML_CUDA_NVFP4_W4A16 must be auto, cublas, chunked, or turbomind");
     }();
     return mode;
 }
@@ -2546,6 +2660,23 @@ static bool ggml_cuda_use_nvfp4_w4a16_cublas_chunked(
         && ggml_is_contiguous(dst);
 }
 
+static bool ggml_cuda_use_nvfp4_w4a16_turbomind(
+        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
+#ifdef GGML_CUDA_TURBOMIND_SM70
+    return ggml_cuda_use_nvfp4_w4a16_cublas_chunked(ctx, src0, src1, dst)
+        && src0->buffer != nullptr
+        && ggml_backend_buffer_is_cuda(src0->buffer)
+        && src0->ne[0] % QK_NVFP4 == 0
+        && src0->ne[1] % 128 == 0;
+#else
+    GGML_UNUSED(ctx);
+    GGML_UNUSED(src0);
+    GGML_UNUSED(src1);
+    GGML_UNUSED(dst);
+    return false;
+#endif
+}
+
 static ggml_cuda_mul_mat_route ggml_cuda_select_mul_mat_route(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
     GGML_TENSOR_BINARY_OP_LOCALS
@@ -2561,6 +2692,10 @@ static ggml_cuda_mul_mat_route ggml_cuda_select_mul_mat_route(
             case ggml_cuda_nvfp4_w4a16_mode::CHUNKED:
                 return ggml_cuda_use_nvfp4_w4a16_cublas_chunked(ctx, src0, src1, dst)
                     ? ggml_cuda_mul_mat_route::NVFP4_W4A16_CUBLAS_CHUNKED
+                    : ggml_cuda_mul_mat_route::NVFP4_W4A16_UNSUPPORTED;
+            case ggml_cuda_nvfp4_w4a16_mode::TURBOMIND:
+                return ggml_cuda_use_nvfp4_w4a16_turbomind(ctx, src0, src1, dst)
+                    ? ggml_cuda_mul_mat_route::NVFP4_W4A16_TURBOMIND_SM70
                     : ggml_cuda_mul_mat_route::NVFP4_W4A16_UNSUPPORTED;
         }
     }
@@ -2642,6 +2777,94 @@ static void ggml_cuda_mul_mat_nvfp4_w4a16_cublas_chunked(
     }
 }
 
+#ifdef GGML_CUDA_TURBOMIND_SM70
+static ggml_cuda_nvfp4_turbomind_prepared * ggml_cuda_get_nvfp4_turbomind_prepared(
+        ggml_backend_cuda_context & ctx, const ggml_tensor * src0) {
+    auto * buffer_ctx = (ggml_backend_cuda_buffer_context *) src0->buffer->context;
+    std::lock_guard<std::mutex> lock(buffer_ctx->nvfp4_turbomind_mutex);
+
+    auto it = buffer_ctx->nvfp4_turbomind_cache.find(src0->data);
+    if (it != buffer_ctx->nvfp4_turbomind_cache.end()) {
+        if (it->second.prepared->k == src0->ne[0] && it->second.prepared->n == src0->ne[1]) {
+            it->second.last_use = ++buffer_ctx->nvfp4_turbomind_cache_clock;
+            return it->second.prepared.get();
+        }
+        buffer_ctx->nvfp4_turbomind_cache_bytes -=
+            it->second.prepared->weight_bytes + it->second.prepared->scale_bytes;
+        ggml_cuda_nvfp4_turbomind_release(it->second.prepared.get());
+        buffer_ctx->nvfp4_turbomind_cache.erase(it);
+    }
+
+    const int64_t k = src0->ne[0];
+    const int64_t n = src0->ne[1];
+    const size_t prepared_bytes = (size_t) k*n/2 + (size_t) k*n/QK_NVFP4_SUB*sizeof(half);
+    const size_t cache_limit = ggml_cuda_nvfp4_turbomind_cache_limit();
+    while (!buffer_ctx->nvfp4_turbomind_cache.empty() &&
+            buffer_ctx->nvfp4_turbomind_cache_bytes + prepared_bytes > cache_limit) {
+        auto oldest = std::min_element(
+            buffer_ctx->nvfp4_turbomind_cache.begin(),
+            buffer_ctx->nvfp4_turbomind_cache.end(),
+            [](const auto & a, const auto & b) { return a.second.last_use < b.second.last_use; });
+        buffer_ctx->nvfp4_turbomind_cache_bytes -=
+            oldest->second.prepared->weight_bytes + oldest->second.prepared->scale_bytes;
+        ggml_cuda_nvfp4_turbomind_release(oldest->second.prepared.get());
+        buffer_ctx->nvfp4_turbomind_cache.erase(oldest);
+    }
+    ggml_cuda_pool_alloc<uint16_t> temp_codes(ctx.pool(), k*n);
+    ggml_cuda_pool_alloc<half> temp_scales(ctx.pool(), (k/QK_NVFP4_SUB)*n);
+    auto prepared = std::make_unique<ggml_cuda_nvfp4_turbomind_prepared>();
+    if (!ggml_cuda_nvfp4_turbomind_prepare(
+            src0->data, k, n, temp_codes.get(), temp_scales.get(), prepared.get(), ctx.stream())) {
+        return nullptr;
+    }
+
+    auto * result = prepared.get();
+    buffer_ctx->nvfp4_turbomind_cache_bytes += prepared_bytes;
+    buffer_ctx->nvfp4_turbomind_cache.emplace(
+        src0->data,
+        ggml_backend_cuda_buffer_context::nvfp4_turbomind_cache_entry{
+            std::move(prepared), ++buffer_ctx->nvfp4_turbomind_cache_clock});
+    return result;
+}
+
+static void ggml_cuda_mul_mat_nvfp4_w4a16_turbomind(
+        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    GGML_ASSERT(ggml_cuda_use_nvfp4_w4a16_turbomind(ctx, src0, src1, dst));
+
+    const int64_t k = src0->ne[0];
+    const int64_t m = src1->ne[1];
+    cudaStream_t stream = ctx.stream();
+
+    auto & workspace = ggml_cuda_get_nvfp4_turbomind_workspace(ctx);
+    auto * prepared = ggml_cuda_get_nvfp4_turbomind_prepared(ctx, src0);
+    if (prepared == nullptr) {
+        GGML_ABORT("failed to prepare SM70 TurboMind NVFP4 weight");
+    }
+
+    ggml_cuda_pool_alloc<half> activation(ctx.pool(), k*m);
+    const to_fp16_cuda_t convert_activation = ggml_get_to_fp16_cuda(src1->type);
+    GGML_ASSERT(convert_activation != nullptr);
+    convert_activation(src1->data, activation.get(), k*m, stream);
+
+    if (!ggml_cuda_nvfp4_turbomind_mul_mat(
+            ggml_cuda_get_physical_device(ctx.device),
+            *prepared,
+            activation.get(),
+            m,
+            (float *) dst->data,
+            workspace.barriers.get(),
+            ggml_cuda_nvfp4_turbomind_barriers_size(),
+            workspace.partials.get(),
+            ggml_cuda_nvfp4_turbomind_partials_size(),
+            workspace.tensormaps.get(),
+            ggml_cuda_nvfp4_turbomind_tensormaps_size(),
+            workspace.flags.get(),
+            stream)) {
+        GGML_ABORT("SM70 TurboMind NVFP4 GEMM failed");
+    }
+}
+#endif
+
 static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     GGML_TENSOR_BINARY_OP_LOCALS
 
@@ -2676,6 +2899,13 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         case ggml_cuda_mul_mat_route::NVFP4_W4A16_CUBLAS_CHUNKED:
             ggml_cuda_mul_mat_nvfp4_w4a16_cublas_chunked(ctx, src0, src1, dst);
             return;
+        case ggml_cuda_mul_mat_route::NVFP4_W4A16_TURBOMIND_SM70:
+#ifdef GGML_CUDA_TURBOMIND_SM70
+            ggml_cuda_mul_mat_nvfp4_w4a16_turbomind(ctx, src0, src1, dst);
+            return;
+#else
+            GGML_ABORT("SM70 TurboMind NVFP4 backend was not built");
+#endif
         case ggml_cuda_mul_mat_route::NVFP4_W4A16_UNSUPPORTED:
             GGML_ABORT("forced SM70 NVFP4 W4A16 route does not support this MUL_MAT");
         case ggml_cuda_mul_mat_route::MMVF:
@@ -2750,6 +2980,8 @@ static const char * ggml_cuda_mul_mat_route_name(ggml_backend_cuda_context & ctx
             return "NVFP4_W4A16_CUBLAS";
         case ggml_cuda_mul_mat_route::NVFP4_W4A16_CUBLAS_CHUNKED:
             return "NVFP4_W4A16_CUBLAS_CHUNKED";
+        case ggml_cuda_mul_mat_route::NVFP4_W4A16_TURBOMIND_SM70:
+            return "NVFP4_W4A16_TURBOMIND_SM70";
         case ggml_cuda_mul_mat_route::NVFP4_W4A16_UNSUPPORTED:
             return "UNSUPPORTED";
         case ggml_cuda_mul_mat_route::MMVF:

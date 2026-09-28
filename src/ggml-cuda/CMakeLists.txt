@@ -3,7 +3,8 @@ cmake_minimum_required(VERSION 3.18)  # for CMAKE_CUDA_ARCHITECTURES
 find_package(CUDAToolkit)
 
 option(GGML_CUDA_TURBOMIND_SM70 "Build the experimental exact-SM70 TurboMind NVFP4 backend" OFF)
-set(GGML_CUDA_CUTLASS_PATH "" CACHE PATH "CUTLASS source root used by the SM70 TurboMind backend")
+option(GGML_CUDA_CUTLASS_SM70_ATTN "Build the experimental exact-SM70 CUTLASS D128 attention backend" OFF)
+set(GGML_CUDA_CUTLASS_PATH "" CACHE PATH "CUTLASS source root used by optional SM70 backends")
 
 if (CUDAToolkit_FOUND)
     message(STATUS "CUDA Toolkit found")
@@ -163,6 +164,19 @@ if (CUDAToolkit_FOUND)
         set_source_files_properties(${GGML_CUDA_TURBOMIND_CUDA_SRCS} PROPERTIES CUDA_ARCHITECTURES 70)
     endif()
 
+    if (GGML_CUDA_CUTLASS_SM70_ATTN)
+        if (NOT EXISTS "${GGML_CUDA_CUTLASS_PATH}/include/cutlass/cutlass.h")
+            message(FATAL_ERROR "GGML_CUDA_CUTLASS_SM70_ATTN requires GGML_CUDA_CUTLASS_PATH pointing to CUTLASS v4.4.2")
+        endif()
+        set(GGML_CUDA_CUTLASS_SM70_ATTN_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/vendors/cutlass-sm70-attention")
+        set(GGML_CUDA_CUTLASS_SM70_ATTN_SOURCE
+            ${GGML_CUDA_CUTLASS_SM70_ATTN_ROOT}/ggml-cutlass-sm70-attention.cu)
+        list(APPEND GGML_SOURCES_CUDA ${GGML_CUDA_CUTLASS_SM70_ATTN_SOURCE})
+        set_source_files_properties(${GGML_CUDA_CUTLASS_SM70_ATTN_SOURCE} PROPERTIES
+            CUDA_ARCHITECTURES 70
+            COMPILE_OPTIONS "-w")
+    endif()
+
     ggml_add_backend_library(ggml-cuda
                              ${GGML_HEADERS_CUDA}
                              ${GGML_SOURCES_CUDA}
@@ -174,6 +188,15 @@ if (CUDAToolkit_FOUND)
             ${GGML_CUDA_TURBOMIND_VENDOR}
             ${GGML_CUDA_CUTLASS_PATH}/include)
         target_compile_definitions(ggml-cuda PRIVATE GGML_CUDA_TURBOMIND_SM70=1 ENABLE_BF16=0)
+        target_compile_options(ggml-cuda PRIVATE "$<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>")
+    endif()
+
+    if (GGML_CUDA_CUTLASS_SM70_ATTN)
+        target_include_directories(ggml-cuda PRIVATE
+            ${GGML_CUDA_CUTLASS_SM70_ATTN_ROOT}
+            ${GGML_CUDA_CUTLASS_PATH}/include
+            ${GGML_CUDA_CUTLASS_PATH}/examples/41_fused_multi_head_attention)
+        target_compile_definitions(ggml-cuda PRIVATE GGML_CUDA_CUTLASS_SM70_ATTN=1)
         target_compile_options(ggml-cuda PRIVATE "$<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>")
     endif()
 

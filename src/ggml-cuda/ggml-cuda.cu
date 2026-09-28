@@ -46,6 +46,7 @@
 #include "ggml-cuda/roll.cuh"
 #include "ggml-cuda/scale.cuh"
 #include "ggml-cuda/sm70-w8a16.cuh"
+#include "ggml-cuda/nvfp4-hmma-sm70.cuh"
 #ifdef GGML_CUDA_TURBOMIND_SM70
 #include "ggml-cuda/vendors/turbomind-sm70/ggml-nvfp4-turbomind.cuh"
 #endif
@@ -2577,6 +2578,7 @@ enum class ggml_cuda_mul_mat_route {
     NVFP4_W4A16_CUBLAS,
     NVFP4_W4A16_CUBLAS_CHUNKED,
     NVFP4_W4A16_TURBOMIND_SM70,
+    NVFP4_W4A16_HMMA_SM70,
     NVFP4_W4A16_UNSUPPORTED,
     MMVF,
     MMVF_TRANSPOSED,
@@ -2590,6 +2592,7 @@ enum class ggml_cuda_nvfp4_w4a16_mode {
     CUBLAS,
     CHUNKED,
     TURBOMIND,
+    HMMA,
 };
 
 static ggml_cuda_nvfp4_w4a16_mode ggml_cuda_get_nvfp4_w4a16_mode() {
@@ -2614,7 +2617,10 @@ static ggml_cuda_nvfp4_w4a16_mode ggml_cuda_get_nvfp4_w4a16_mode() {
         if (value == "turbomind") {
             return ggml_cuda_nvfp4_w4a16_mode::TURBOMIND;
         }
-        GGML_ABORT("GGML_CUDA_NVFP4_W4A16 must be auto, cublas, chunked, or turbomind");
+        if (value == "hmma") {
+            return ggml_cuda_nvfp4_w4a16_mode::HMMA;
+        }
+        GGML_ABORT("GGML_CUDA_NVFP4_W4A16 must be auto, cublas, chunked, turbomind, or hmma");
     }();
     return mode;
 }
@@ -2660,6 +2666,12 @@ static bool ggml_cuda_use_nvfp4_w4a16_cublas_chunked(
         && ggml_is_contiguous(dst);
 }
 
+static bool ggml_cuda_use_nvfp4_w4a16_hmma(
+        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
+    return ggml_cuda_use_nvfp4_w4a16_cublas_chunked(ctx, src0, src1, dst)
+        && src0->ne[1] % 32 == 0;
+}
+
 static bool ggml_cuda_use_nvfp4_w4a16_turbomind(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
 #ifdef GGML_CUDA_TURBOMIND_SM70
@@ -2696,6 +2708,10 @@ static ggml_cuda_mul_mat_route ggml_cuda_select_mul_mat_route(
             case ggml_cuda_nvfp4_w4a16_mode::TURBOMIND:
                 return ggml_cuda_use_nvfp4_w4a16_turbomind(ctx, src0, src1, dst)
                     ? ggml_cuda_mul_mat_route::NVFP4_W4A16_TURBOMIND_SM70
+                    : ggml_cuda_mul_mat_route::NVFP4_W4A16_UNSUPPORTED;
+            case ggml_cuda_nvfp4_w4a16_mode::HMMA:
+                return ggml_cuda_use_nvfp4_w4a16_hmma(ctx, src0, src1, dst)
+                    ? ggml_cuda_mul_mat_route::NVFP4_W4A16_HMMA_SM70
                     : ggml_cuda_mul_mat_route::NVFP4_W4A16_UNSUPPORTED;
         }
     }
@@ -2740,6 +2756,16 @@ static void ggml_cuda_mul_mat_nvfp4_w4a16_cublas(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     GGML_ASSERT(ggml_cuda_use_nvfp4_w4a16_cublas(ctx, src0, src1, dst));
     ggml_cuda_mul_mat_cublas_impl<GGML_TYPE_F16>(ctx, src0, src1, dst);
+}
+
+static void ggml_cuda_mul_mat_nvfp4_w4a16_hmma(
+        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    GGML_ASSERT(ggml_cuda_use_nvfp4_w4a16_hmma(ctx, src0, src1, dst));
+    ggml_cuda_nvfp4_hmma_sm70(
+        static_cast<const block_nvfp4 *>(src0->data),
+        static_cast<const float *>(src1->data),
+        static_cast<float *>(dst->data),
+        src0->ne[0], src0->ne[1], src1->ne[1], ctx.stream());
 }
 
 static void ggml_cuda_mul_mat_nvfp4_w4a16_cublas_chunked(
@@ -2906,6 +2932,9 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
 #else
             GGML_ABORT("SM70 TurboMind NVFP4 backend was not built");
 #endif
+        case ggml_cuda_mul_mat_route::NVFP4_W4A16_HMMA_SM70:
+            ggml_cuda_mul_mat_nvfp4_w4a16_hmma(ctx, src0, src1, dst);
+            return;
         case ggml_cuda_mul_mat_route::NVFP4_W4A16_UNSUPPORTED:
             GGML_ABORT("forced SM70 NVFP4 W4A16 route does not support this MUL_MAT");
         case ggml_cuda_mul_mat_route::MMVF:
@@ -2982,6 +3011,8 @@ static const char * ggml_cuda_mul_mat_route_name(ggml_backend_cuda_context & ctx
             return "NVFP4_W4A16_CUBLAS_CHUNKED";
         case ggml_cuda_mul_mat_route::NVFP4_W4A16_TURBOMIND_SM70:
             return "NVFP4_W4A16_TURBOMIND_SM70";
+        case ggml_cuda_mul_mat_route::NVFP4_W4A16_HMMA_SM70:
+            return "NVFP4_W4A16_HMMA_SM70";
         case ggml_cuda_mul_mat_route::NVFP4_W4A16_UNSUPPORTED:
             return "UNSUPPORTED";
         case ggml_cuda_mul_mat_route::MMVF:

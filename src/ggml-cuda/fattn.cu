@@ -7,6 +7,9 @@
 #ifdef GGML_CUDA_CUTLASS_SM70_ATTN
 #include "vendors/cutlass-sm70-attention/ggml-cutlass-sm70-attention.cuh"
 #endif
+#ifdef GGML_CUDA_FLASHINFER_SM70_ATTN
+#include "vendors/flashinfer-sm70-attention/ggml-flashinfer-sm70-attention.cuh"
+#endif
 
 #include <cctype>
 #include <climits>
@@ -343,12 +346,14 @@ enum best_fattn_kernel {
     BEST_FATTN_KERNEL_TILE          = 200,
     BEST_FATTN_KERNEL_VEC           = 100,
     BEST_FATTN_KERNEL_MMA_F16       = 400,
-    BEST_FATTN_KERNEL_CUTLASS_SM70  = 500,
+    BEST_FATTN_KERNEL_CUTLASS_SM70    = 500,
+    BEST_FATTN_KERNEL_FLASHINFER_SM70 = 600,
 };
 
 enum class ggml_cuda_sm70_attention_mode {
     AUTO,
     CUTLASS,
+    FLASHINFER,
 };
 
 static ggml_cuda_sm70_attention_mode ggml_cuda_get_sm70_attention_mode() {
@@ -367,7 +372,10 @@ static ggml_cuda_sm70_attention_mode ggml_cuda_get_sm70_attention_mode() {
         if (value == "cutlass") {
             return ggml_cuda_sm70_attention_mode::CUTLASS;
         }
-        GGML_ABORT("GGML_CUDA_SM70_ATTN must be auto or cutlass");
+        if (value == "flashinfer") {
+            return ggml_cuda_sm70_attention_mode::FLASHINFER;
+        }
+        GGML_ABORT("GGML_CUDA_SM70_ATTN must be auto, cutlass or flashinfer");
     }();
     return mode;
 }
@@ -426,8 +434,8 @@ static bool ggml_cuda_fattn_kv_type_supported(ggml_type type) {
     }
 }
 
-static bool ggml_cuda_use_cutlass_sm70_attention(const int device, const ggml_tensor * dst) {
-#ifdef GGML_CUDA_CUTLASS_SM70_ATTN
+#if defined(GGML_CUDA_CUTLASS_SM70_ATTN) || defined(GGML_CUDA_FLASHINFER_SM70_ATTN)
+static bool ggml_cuda_use_sm70_d128_attention_common(const int device, const ggml_tensor * dst) {
     const ggml_tensor * Q = dst->src[0];
     const ggml_tensor * K = dst->src[1];
     const ggml_tensor * V = dst->src[2];
@@ -465,6 +473,23 @@ static bool ggml_cuda_use_cutlass_sm70_attention(const int device, const ggml_te
         && Q->ne[2] * 128 <= INT_MAX
         && std::isfinite(scale) && scale > 0.0f
         && max_bias == 0.0f && logit_softcap == 0.0f;
+}
+#endif
+
+static bool ggml_cuda_use_cutlass_sm70_attention(const int device, const ggml_tensor * dst) {
+#ifdef GGML_CUDA_CUTLASS_SM70_ATTN
+    return ggml_cuda_use_sm70_d128_attention_common(device, dst);
+#else
+    GGML_UNUSED(device);
+    GGML_UNUSED(dst);
+    return false;
+#endif
+}
+
+static bool ggml_cuda_use_flashinfer_sm70_attention(const int device, const ggml_tensor * dst) {
+#ifdef GGML_CUDA_FLASHINFER_SM70_ATTN
+    return ggml_cuda_use_sm70_d128_attention_common(device, dst)
+        && dst->src[0]->ne[1] == dst->src[1]->ne[1];
 #else
     GGML_UNUSED(device);
     GGML_UNUSED(dst);
@@ -520,6 +545,50 @@ static void ggml_cuda_flash_attn_ext_cutlass_sm70(ggml_backend_cuda_context & ct
 }
 #endif
 
+#ifdef GGML_CUDA_FLASHINFER_SM70_ATTN
+static void ggml_cuda_flash_attn_ext_flashinfer_sm70(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    GGML_ASSERT(ggml_cuda_use_flashinfer_sm70_attention(ctx.device, dst));
+    const ggml_tensor * Q = dst->src[0];
+    const ggml_tensor * K = dst->src[1];
+    const ggml_tensor * V = dst->src[2];
+    const int64_t length = Q->ne[1];
+    const int64_t heads = Q->ne[2];
+    const int64_t batches = Q->ne[3];
+    const cudaStream_t stream = ctx.stream();
+
+    ggml_cuda_pool_alloc<half> q_f16(ctx.pool(), ggml_nelements(Q));
+    ggml_cuda_pool_alloc<half> output_f16(ctx.pool(), ggml_nelements(dst));
+    ggml_get_to_fp16_cuda(GGML_TYPE_F32)(Q->data, q_f16.get(), ggml_nelements(Q), stream);
+
+    float scale = 0.0f;
+    memcpy(&scale, (const float *) dst->op_params, sizeof(scale));
+    const ggml_cuda_flashinfer_sm70_attention_params params{
+        q_f16.get(),
+        static_cast<const half *>(K->data),
+        static_cast<const half *>(V->data),
+        output_f16.get(),
+        static_cast<int>(length),
+        static_cast<int>(heads),
+        static_cast<int>(batches),
+        scale,
+        128,
+        length * 128,
+        heads * length * 128,
+        static_cast<int64_t>(K->nb[1] / sizeof(half)),
+        static_cast<int64_t>(K->nb[2] / sizeof(half)),
+        static_cast<int64_t>(K->nb[3] / sizeof(half)),
+        static_cast<int64_t>(V->nb[1] / sizeof(half)),
+        static_cast<int64_t>(V->nb[2] / sizeof(half)),
+        static_cast<int64_t>(V->nb[3] / sizeof(half)),
+        heads * 128,
+        128,
+        length * heads * 128,
+    };
+    ggml_cuda_flashinfer_sm70_attention(params, stream);
+    ggml_get_to_fp32_cuda(GGML_TYPE_F16)(output_f16.get(), static_cast<float *>(dst->data), ggml_nelements(dst), stream);
+}
+#endif
+
 static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const ggml_tensor * dst) {
 #ifndef FLASH_ATTN_AVAILABLE
     GGML_UNUSED(device); GGML_UNUSED(dst);
@@ -535,6 +604,12 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     if (ggml_cuda_get_sm70_attention_mode() == ggml_cuda_sm70_attention_mode::CUTLASS) {
         return ggml_cuda_use_cutlass_sm70_attention(device, dst)
             ? BEST_FATTN_KERNEL_CUTLASS_SM70
+            : BEST_FATTN_KERNEL_NONE;
+    }
+
+    if (ggml_cuda_get_sm70_attention_mode() == ggml_cuda_sm70_attention_mode::FLASHINFER) {
+        return ggml_cuda_use_flashinfer_sm70_attention(device, dst)
+            ? BEST_FATTN_KERNEL_FLASHINFER_SM70
             : BEST_FATTN_KERNEL_NONE;
     }
 
@@ -717,6 +792,8 @@ const char * ggml_cuda_flash_attn_ext_get_route(int device, const ggml_tensor * 
             return volta_mma_available(cc) ? "FATTN_MMA_VOLTA" : "FATTN_MMA_F16";
         case BEST_FATTN_KERNEL_CUTLASS_SM70:
             return "FATTN_CUTLASS_SM70";
+        case BEST_FATTN_KERNEL_FLASHINFER_SM70:
+            return "FATTN_FLASHINFER_SM70";
     }
     return "UNKNOWN";
 }
@@ -746,6 +823,7 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
             need_f16_V = V->type == GGML_TYPE_F32;
             break;
         case BEST_FATTN_KERNEL_CUTLASS_SM70:
+        case BEST_FATTN_KERNEL_FLASHINFER_SM70:
             break;
         case BEST_FATTN_KERNEL_NONE:
             break;
@@ -777,6 +855,13 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
             break;
 #else
             GGML_ABORT("SM70 CUTLASS attention backend was not built");
+#endif
+        case BEST_FATTN_KERNEL_FLASHINFER_SM70:
+#ifdef GGML_CUDA_FLASHINFER_SM70_ATTN
+            ggml_cuda_flash_attn_ext_flashinfer_sm70(ctx, dst);
+            break;
+#else
+            GGML_ABORT("SM70 FlashInfer attention backend was not built");
 #endif
     }
 }

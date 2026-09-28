@@ -4,6 +4,7 @@ find_package(CUDAToolkit)
 
 option(GGML_CUDA_TURBOMIND_SM70 "Build the experimental exact-SM70 TurboMind NVFP4 backend" OFF)
 option(GGML_CUDA_CUTLASS_SM70_ATTN "Build the experimental exact-SM70 CUTLASS D128 attention backend" OFF)
+option(GGML_CUDA_FLASHINFER_SM70_ATTN "Build the experimental exact-SM70 FlashInfer D128 attention backend" OFF)
 set(GGML_CUDA_CUTLASS_PATH "" CACHE PATH "CUTLASS source root used by optional SM70 backends")
 
 if (CUDAToolkit_FOUND)
@@ -177,6 +178,16 @@ if (CUDAToolkit_FOUND)
             COMPILE_OPTIONS "-w")
     endif()
 
+    if (GGML_CUDA_FLASHINFER_SM70_ATTN)
+        set(GGML_CUDA_FLASHINFER_SM70_ATTN_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/vendors/flashinfer-sm70-attention")
+        set(GGML_CUDA_FLASHINFER_SM70_ATTN_SOURCE
+            ${GGML_CUDA_FLASHINFER_SM70_ATTN_ROOT}/ggml-flashinfer-sm70-attention.cu)
+        list(APPEND GGML_SOURCES_CUDA ${GGML_CUDA_FLASHINFER_SM70_ATTN_SOURCE})
+        set_source_files_properties(${GGML_CUDA_FLASHINFER_SM70_ATTN_SOURCE} PROPERTIES
+            CUDA_ARCHITECTURES 70
+            COMPILE_OPTIONS "-w")
+    endif()
+
     ggml_add_backend_library(ggml-cuda
                              ${GGML_HEADERS_CUDA}
                              ${GGML_SOURCES_CUDA}
@@ -198,6 +209,11 @@ if (CUDAToolkit_FOUND)
             ${GGML_CUDA_CUTLASS_PATH}/examples/41_fused_multi_head_attention)
         target_compile_definitions(ggml-cuda PRIVATE GGML_CUDA_CUTLASS_SM70_ATTN=1)
         target_compile_options(ggml-cuda PRIVATE "$<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>")
+    endif()
+
+    if (GGML_CUDA_FLASHINFER_SM70_ATTN)
+        target_include_directories(ggml-cuda PRIVATE ${GGML_CUDA_FLASHINFER_SM70_ATTN_ROOT})
+        target_compile_definitions(ggml-cuda PRIVATE GGML_CUDA_FLASHINFER_SM70_ATTN=1)
     endif()
 
     if (CUDAToolkit_VERSION VERSION_GREATER_EQUAL "11.8")

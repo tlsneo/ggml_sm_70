@@ -352,6 +352,7 @@ enum best_fattn_kernel {
 
 enum class ggml_cuda_sm70_attention_mode {
     AUTO,
+    MMA,
     CUTLASS,
     FLASHINFER,
 };
@@ -369,13 +370,16 @@ static ggml_cuda_sm70_attention_mode ggml_cuda_get_sm70_attention_mode() {
         if (value == "auto") {
             return ggml_cuda_sm70_attention_mode::AUTO;
         }
+        if (value == "mma") {
+            return ggml_cuda_sm70_attention_mode::MMA;
+        }
         if (value == "cutlass") {
             return ggml_cuda_sm70_attention_mode::CUTLASS;
         }
         if (value == "flashinfer") {
             return ggml_cuda_sm70_attention_mode::FLASHINFER;
         }
-        GGML_ABORT("GGML_CUDA_SM70_ATTN must be auto, cutlass or flashinfer");
+        GGML_ABORT("GGML_CUDA_SM70_ATTN must be auto, mma, cutlass or flashinfer");
     }();
     return mode;
 }
@@ -611,6 +615,11 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         return ggml_cuda_use_flashinfer_sm70_attention(device, dst)
             ? BEST_FATTN_KERNEL_FLASHINFER_SM70
             : BEST_FATTN_KERNEL_NONE;
+    }
+
+    if (ggml_cuda_get_sm70_attention_mode() == ggml_cuda_sm70_attention_mode::AUTO
+            && ggml_cuda_use_cutlass_sm70_attention(device, dst)) {
+        return BEST_FATTN_KERNEL_CUTLASS_SM70;
     }
 
     const int gqa_ratio = Q->ne[2] / K->ne[2];

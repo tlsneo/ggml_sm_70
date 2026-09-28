@@ -2466,12 +2466,60 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
 enum class ggml_cuda_mul_mat_route {
     CUBLAS,
     NVFP4_W4A16_CUBLAS,
+    NVFP4_W4A16_CUBLAS_CHUNKED,
+    NVFP4_W4A16_UNSUPPORTED,
     MMVF,
     MMVF_TRANSPOSED,
     MMF,
     MMVQ,
     MMQ,
 };
+
+enum class ggml_cuda_nvfp4_w4a16_mode {
+    AUTO,
+    CUBLAS,
+    CHUNKED,
+};
+
+static ggml_cuda_nvfp4_w4a16_mode ggml_cuda_get_nvfp4_w4a16_mode() {
+    static const ggml_cuda_nvfp4_w4a16_mode mode = [] {
+        const char * env = getenv("GGML_CUDA_NVFP4_W4A16");
+        if (env == nullptr) {
+            return ggml_cuda_nvfp4_w4a16_mode::AUTO;
+        }
+        std::string value = env;
+        for (char & c : value) {
+            c = std::tolower(c);
+        }
+        if (value == "auto") {
+            return ggml_cuda_nvfp4_w4a16_mode::AUTO;
+        }
+        if (value == "cublas") {
+            return ggml_cuda_nvfp4_w4a16_mode::CUBLAS;
+        }
+        if (value == "chunked") {
+            return ggml_cuda_nvfp4_w4a16_mode::CHUNKED;
+        }
+        GGML_ABORT("GGML_CUDA_NVFP4_W4A16 must be auto, cublas, or chunked");
+    }();
+    return mode;
+}
+
+static int64_t ggml_cuda_get_nvfp4_w4a16_tile_n() {
+    static const int64_t tile_n = [] {
+        const char * env = getenv("GGML_CUDA_NVFP4_W4A16_TILE_N");
+        if (env == nullptr) {
+            return int64_t(4096);
+        }
+        char * end = nullptr;
+        const long value = strtol(env, &end, 10);
+        if (end == env || *end != '\0' || value <= 0) {
+            GGML_ABORT("GGML_CUDA_NVFP4_W4A16_TILE_N must be a positive integer");
+        }
+        return int64_t(value);
+    }();
+    return tile_n;
+}
 
 static bool ggml_cuda_use_nvfp4_w4a16_cublas(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
@@ -2483,9 +2531,39 @@ static bool ggml_cuda_use_nvfp4_w4a16_cublas(
         && ggml_cuda_mul_mat_cublas_compute_type(ctx, src0, dst) == GGML_TYPE_F16;
 }
 
+static bool ggml_cuda_use_nvfp4_w4a16_cublas_chunked(
+        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
+    return ggml_cuda_use_nvfp4_w4a16_cublas(ctx, src0, src1, dst)
+        && src0->ne[2] == 1 && src0->ne[3] == 1
+        && src1->ne[2] == 1 && src1->ne[3] == 1
+        && dst->ne[2] == 1 && dst->ne[3] == 1
+        && src0->ne[0] % QK_NVFP4 == 0
+        && src0->ne[0] == src1->ne[0]
+        && src0->ne[1] == dst->ne[0]
+        && src1->ne[1] == dst->ne[1]
+        && ggml_is_contiguous(src0)
+        && ggml_is_contiguous(src1)
+        && ggml_is_contiguous(dst);
+}
+
 static ggml_cuda_mul_mat_route ggml_cuda_select_mul_mat_route(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
     GGML_TENSOR_BINARY_OP_LOCALS
+
+    if (src0->type == GGML_TYPE_NVFP4) {
+        switch (ggml_cuda_get_nvfp4_w4a16_mode()) {
+            case ggml_cuda_nvfp4_w4a16_mode::AUTO:
+                break;
+            case ggml_cuda_nvfp4_w4a16_mode::CUBLAS:
+                return ggml_cuda_use_nvfp4_w4a16_cublas(ctx, src0, src1, dst)
+                    ? ggml_cuda_mul_mat_route::NVFP4_W4A16_CUBLAS
+                    : ggml_cuda_mul_mat_route::NVFP4_W4A16_UNSUPPORTED;
+            case ggml_cuda_nvfp4_w4a16_mode::CHUNKED:
+                return ggml_cuda_use_nvfp4_w4a16_cublas_chunked(ctx, src0, src1, dst)
+                    ? ggml_cuda_mul_mat_route::NVFP4_W4A16_CUBLAS_CHUNKED
+                    : ggml_cuda_mul_mat_route::NVFP4_W4A16_UNSUPPORTED;
+        }
+    }
 
     // If src0 is a temporary compute buffer it may have some padding that needs to be cleared for mul_mat_vec_q or mul_mat_q.
     // But if src0 is also a view of another tensor then this cannot be done safely because it may overwrite valid tensor data.
@@ -2529,6 +2607,41 @@ static void ggml_cuda_mul_mat_nvfp4_w4a16_cublas(
     ggml_cuda_mul_mat_cublas_impl<GGML_TYPE_F16>(ctx, src0, src1, dst);
 }
 
+static void ggml_cuda_mul_mat_nvfp4_w4a16_cublas_chunked(
+        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    GGML_ASSERT(ggml_cuda_use_nvfp4_w4a16_cublas_chunked(ctx, src0, src1, dst));
+
+    const int64_t k = src0->ne[0];
+    const int64_t n = src0->ne[1];
+    const int64_t m = src1->ne[1];
+    const int64_t tile_n = std::min(n, ggml_cuda_get_nvfp4_w4a16_tile_n());
+
+    cudaStream_t stream = ctx.stream();
+    CUBLAS_CHECK(cublasSetStream(ctx.cublas_handle(), stream));
+
+    ggml_cuda_pool_alloc<half> activation(ctx.pool(), k*m);
+    ggml_cuda_pool_alloc<half> weights(ctx.pool(), k*tile_n);
+    const to_fp16_cuda_t convert_activation = ggml_get_to_fp16_cuda(src1->type);
+    const to_fp16_cuda_t convert_weights = ggml_get_to_fp16_cuda(src0->type);
+    GGML_ASSERT(convert_activation != nullptr && convert_weights != nullptr);
+    convert_activation(src1->data, activation.get(), k*m, stream);
+
+    const float alpha = 1.0f;
+    const float beta = 0.0f;
+    for (int64_t row = 0; row < n; row += tile_n) {
+        const int64_t rows = std::min(tile_n, n - row);
+        const char * src0_tile = (const char *) src0->data + row*src0->nb[1];
+        convert_weights(src0_tile, weights.get(), k*rows, stream);
+        CUBLAS_CHECK(cublasGemmEx(ctx.cublas_handle(), CUBLAS_OP_T, CUBLAS_OP_N,
+                rows, m, k,
+                &alpha, weights.get(), CUDA_R_16F, k,
+                        activation.get(), CUDA_R_16F, k,
+                &beta, (float *) dst->data + row, CUDA_R_32F, n,
+                CUBLAS_COMPUTE_32F,
+                CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+    }
+}
+
 static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     GGML_TENSOR_BINARY_OP_LOCALS
 
@@ -2560,6 +2673,11 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         case ggml_cuda_mul_mat_route::NVFP4_W4A16_CUBLAS:
             ggml_cuda_mul_mat_nvfp4_w4a16_cublas(ctx, src0, src1, dst);
             return;
+        case ggml_cuda_mul_mat_route::NVFP4_W4A16_CUBLAS_CHUNKED:
+            ggml_cuda_mul_mat_nvfp4_w4a16_cublas_chunked(ctx, src0, src1, dst);
+            return;
+        case ggml_cuda_mul_mat_route::NVFP4_W4A16_UNSUPPORTED:
+            GGML_ABORT("forced SM70 NVFP4 W4A16 route does not support this MUL_MAT");
         case ggml_cuda_mul_mat_route::MMVF:
             // The custom F16 vector kernel can be used over batched cuBLAS GEMM.
             // But this is only faster for GPUs without tensor cores or with a thin src0 matrix (particularly KQV in attention).
@@ -2630,6 +2748,10 @@ static const char * ggml_cuda_mul_mat_route_name(ggml_backend_cuda_context & ctx
             return ggml_cuda_cublas_route_name(ctx, src0, dst);
         case ggml_cuda_mul_mat_route::NVFP4_W4A16_CUBLAS:
             return "NVFP4_W4A16_CUBLAS";
+        case ggml_cuda_mul_mat_route::NVFP4_W4A16_CUBLAS_CHUNKED:
+            return "NVFP4_W4A16_CUBLAS_CHUNKED";
+        case ggml_cuda_mul_mat_route::NVFP4_W4A16_UNSUPPORTED:
+            return "UNSUPPORTED";
         case ggml_cuda_mul_mat_route::MMVF:
         case ggml_cuda_mul_mat_route::MMVF_TRANSPOSED:
             return "MMVF";

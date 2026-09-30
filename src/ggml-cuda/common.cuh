@@ -1412,6 +1412,14 @@ struct ggml_cuda_stream_context {
     }
 };
 
+enum class ggml_cuda_graph_state {
+    DISABLED,
+    WARMUP,
+    CAPTURED,
+    REPLAYED,
+    UPDATED,
+};
+
 struct ggml_backend_cuda_context {
     int device;
     std::string name;
@@ -1424,6 +1432,7 @@ struct ggml_backend_cuda_context {
 #endif
 
     int curr_stream_no = 0;
+    ggml_cuda_graph_state last_graph_state = ggml_cuda_graph_state::DISABLED;
 
 #ifdef USE_CUDA_GRAPH
     // Map from first_node_ptr to cuda_graph - allows multiple graphs per context

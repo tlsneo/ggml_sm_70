@@ -5333,9 +5333,11 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
 
     ggml_cuda_set_device(cuda_ctx->device);
+    cuda_ctx->last_graph_state = ggml_cuda_graph_state::DISABLED;
 
     bool use_cuda_graph             = false;
     bool cuda_graph_update_required = false;
+    bool cuda_graph_had_instance    = false;
     const void * graph_key = nullptr;
 
 #ifdef USE_CUDA_GRAPH
@@ -5356,17 +5358,21 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
                     GGML_LOG_DEBUG("%s: CUDA graph warmup complete\n", __func__);
                     use_cuda_graph = true;
                     cuda_graph_update_required = true;
+                    cuda_graph_had_instance = graph->instance != nullptr;
+                } else {
+                    cuda_ctx->last_graph_state = ggml_cuda_graph_state::WARMUP;
                 }
-                // else: properties changed or first call - execute directly (use_cuda_graph stays false)
             } else {
                 // Post-warmup: normal CUDA graph operation
                 if (properties_changed) {
                     // Properties changed - reset warmup, execute directly until stable again
                     graph->warmup_complete = false;
+                    cuda_ctx->last_graph_state = ggml_cuda_graph_state::WARMUP;
                     GGML_LOG_DEBUG("%s: CUDA graph warmup reset\n", __func__);
                 } else {
                     use_cuda_graph = true;
                     cuda_graph_update_required = graph->instance == nullptr;
+                    cuda_graph_had_instance = graph->instance != nullptr;
                 }
             }
         }
@@ -5384,6 +5390,16 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     }
 
     ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
+
+    if (use_cuda_graph) {
+        if (!cuda_graph_update_required) {
+            cuda_ctx->last_graph_state = ggml_cuda_graph_state::REPLAYED;
+        } else if (cuda_graph_had_instance) {
+            cuda_ctx->last_graph_state = ggml_cuda_graph_state::UPDATED;
+        } else {
+            cuda_ctx->last_graph_state = ggml_cuda_graph_state::CAPTURED;
+        }
+    }
 
     return GGML_STATUS_SUCCESS;
 }
@@ -6709,6 +6725,21 @@ static bool ggml_backend_cuda_qk_rmsnorm_rope_sm70(
     return true;
 }
 
+static const char * ggml_backend_cuda_get_graph_state(ggml_backend_t backend) {
+    if (!ggml_backend_is_cuda(backend)) {
+        return "disabled";
+    }
+    const ggml_backend_cuda_context * ctx = (const ggml_backend_cuda_context *) backend->context;
+    switch (ctx->last_graph_state) {
+        case ggml_cuda_graph_state::DISABLED: return "disabled";
+        case ggml_cuda_graph_state::WARMUP:   return "warmup";
+        case ggml_cuda_graph_state::CAPTURED: return "captured";
+        case ggml_cuda_graph_state::REPLAYED: return "replayed";
+        case ggml_cuda_graph_state::UPDATED:  return "updated";
+    }
+    GGML_ABORT("invalid CUDA graph state");
+}
+
 static const char * ggml_backend_cuda_get_op_route(ggml_backend_t backend, const ggml_tensor * op) {
     if (!ggml_backend_is_cuda(backend) || op == nullptr) {
         return "UNKNOWN";
@@ -6767,6 +6798,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_cuda_get_op_route") == 0) {
         return (void *)ggml_backend_cuda_get_op_route;
+    }
+    if (strcmp(name, "ggml_backend_cuda_get_graph_state") == 0) {
+        return (void *)ggml_backend_cuda_get_graph_state;
     }
     if (strcmp(name, "ggml_backend_cuda_qk_rmsnorm_rope_sm70") == 0) {
         return (void *)ggml_backend_cuda_qk_rmsnorm_rope_sm70;

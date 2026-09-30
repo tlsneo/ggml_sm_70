@@ -7,7 +7,8 @@
 
 void ggml_cuda_mul_mat_i8_sm70_w8a16(
         const int8_t * weight,
-        const float * input,
+        const void * input,
+        bool input_f16,
         const float * weight_scales,
         const float * bias,
         float * output,

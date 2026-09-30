@@ -8,8 +8,22 @@
 
 namespace {
 
+template <typename T>
+__device__ __forceinline__ float sm70_input_to_float(T value);
+
+template <>
+__device__ __forceinline__ float sm70_input_to_float<float>(float value) {
+    return value;
+}
+
+template <>
+__device__ __forceinline__ float sm70_input_to_float<half>(half value) {
+    return __half2float(value);
+}
+
+template <typename T>
 __global__ void prepare_fp16_rows_sm70(
-        const float * input, half * output, float * scales, int64_t rows, int width) {
+        const T * input, half * output, float * scales, int64_t rows, int width) {
     __shared__ float warp_maxima[8];
     __shared__ float row_scale;
 
@@ -20,7 +34,7 @@ __global__ void prepare_fp16_rows_sm70(
     for (int64_t row = blockIdx.x; row < rows; row += gridDim.x) {
         float maximum = 0.0f;
         for (int col = tid; col < width; col += blockDim.x) {
-            const float value = fabsf(input[row * width + col]);
+            const float value = fabsf(sm70_input_to_float(input[row * width + col]));
             maximum = fmaxf(maximum, isnan(value) ? INFINITY : value);
         }
 #pragma unroll
@@ -50,7 +64,8 @@ __global__ void prepare_fp16_rows_sm70(
         __syncthreads();
 
         for (int col = tid; col < width; col += blockDim.x) {
-            output[row * width + col] = __float2half_rn(input[row * width + col] / row_scale);
+            output[row * width + col] = __float2half_rn(
+                sm70_input_to_float(input[row * width + col]) / row_scale);
         }
         __syncthreads();
     }
@@ -139,7 +154,8 @@ __global__ void restore_rows_sm70(
 
 void ggml_cuda_mul_mat_i8_sm70_w8a16(
         const int8_t * weight,
-        const float * input,
+        const void * input,
+        bool input_f16,
         const float * weight_scales,
         const float * bias,
         float * output,
@@ -161,8 +177,13 @@ void ggml_cuda_mul_mat_i8_sm70_w8a16(
     GGML_ASSERT(n > 0 && n <= INT_MAX);
     GGML_ASSERT(rows > 0 && rows <= INT_MAX);
 
-    prepare_fp16_rows_sm70<<<std::min<int64_t>(rows, 65535), 256, 0, stream>>>(
-        input, activation_f16, activation_scales, rows, (int) k);
+    if (input_f16) {
+        prepare_fp16_rows_sm70<<<std::min<int64_t>(rows, 65535), 256, 0, stream>>>(
+            static_cast<const half *>(input), activation_f16, activation_scales, rows, (int) k);
+    } else {
+        prepare_fp16_rows_sm70<<<std::min<int64_t>(rows, 65535), 256, 0, stream>>>(
+            static_cast<const float *>(input), activation_f16, activation_scales, rows, (int) k);
+    }
     CUDA_CHECK(cudaGetLastError());
 
     const int64_t groups = rows * (k / 256);

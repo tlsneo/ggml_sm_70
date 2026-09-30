@@ -3341,7 +3341,7 @@ GGML_API struct ggml_tensor * ggml_mul_mat_i8_tensorwise(
         struct ggml_tensor  * bias,
         int                   convrot_group_size) {
     GGML_ASSERT(weight->type == GGML_TYPE_I8);
-    GGML_ASSERT(input->type == GGML_TYPE_F32 || input->type == GGML_TYPE_I8);
+    GGML_ASSERT(input->type == GGML_TYPE_F32 || input->type == GGML_TYPE_F16 || input->type == GGML_TYPE_I8);
     GGML_ASSERT(weight_scale != NULL && weight_scale->type == GGML_TYPE_F32);
     GGML_ASSERT(ggml_is_contiguous(weight_scale));
     GGML_ASSERT(ggml_nelements(weight_scale) == weight->ne[1]);

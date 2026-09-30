@@ -1811,8 +1811,17 @@ static bool ggml_cuda_op_quantize_i8_convrot(
 }
 
 static bool ggml_cuda_use_sm70_w8a16(ggml_backend_cuda_context & ctx, const ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+    const ggml_tensor * logical_input = src1 != nullptr && src1->type == GGML_TYPE_I8 ? dst->src[4] : src1;
     const int cc = ggml_cuda_info().devices[ctx.device].cc;
-    return volta_mma_available(cc) && ggml_get_op_params_i32(dst, 2) == 256;
+    return volta_mma_available(cc) && ggml_get_op_params_i32(dst, 2) == 256
+        && src0 != nullptr && src0->type == GGML_TYPE_I8
+        && logical_input != nullptr
+        && (logical_input->type == GGML_TYPE_F32 || logical_input->type == GGML_TYPE_F16)
+        && logical_input->ne[0] == src0->ne[0]
+        && ggml_nrows(logical_input) == ggml_nrows(dst)
+        && ggml_is_contiguous(logical_input);
 }
 
 static void ggml_cuda_mul_mat_i8(
@@ -1821,7 +1830,7 @@ static void ggml_cuda_mul_mat_i8(
         const ggml_tensor * src1,
         ggml_tensor * dst) {
     GGML_ASSERT(src0->type == GGML_TYPE_I8);
-    GGML_ASSERT(src1->type == GGML_TYPE_F32 || src1->type == GGML_TYPE_I8);
+    GGML_ASSERT(src1->type == GGML_TYPE_F32 || src1->type == GGML_TYPE_F16 || src1->type == GGML_TYPE_I8);
     GGML_ASSERT(dst->type == GGML_TYPE_F32);
     GGML_ASSERT(src0->ne[2] == 1 && src0->ne[3] == 1);
     GGML_ASSERT(ggml_is_contiguous(src0));
@@ -1840,7 +1849,8 @@ static void ggml_cuda_mul_mat_i8(
     GGML_ASSERT(src1->ne[0] == k);
     GGML_ASSERT(!prequantized || (src1->op == GGML_OP_QUANTIZE_I8_CONVROT &&
                                   src1->ne[1] == rows_padded + scale_rows));
-    GGML_ASSERT(logical_input != nullptr && logical_input->type == GGML_TYPE_F32);
+    GGML_ASSERT(logical_input != nullptr &&
+                (logical_input->type == GGML_TYPE_F32 || logical_input->type == GGML_TYPE_F16));
     GGML_ASSERT(logical_input->ne[0] == k && ggml_nrows(logical_input) == rows);
     GGML_ASSERT(ggml_is_contiguous(logical_input));
     GGML_ASSERT(convrot_group_size == 0 || convrot_group_size == 256);
@@ -1854,7 +1864,8 @@ static void ggml_cuda_mul_mat_i8(
         ggml_cuda_pool_alloc<float> activation_scales(ctx.pool(), rows);
         ggml_cuda_mul_mat_i8_sm70_w8a16(
             (const int8_t *) src0->data,
-            (const float *) logical_input->data,
+            logical_input->data,
+            logical_input->type == GGML_TYPE_F16,
             weight_scales,
             bias,
             (float *) dst->data,
@@ -1865,6 +1876,7 @@ static void ggml_cuda_mul_mat_i8(
         return;
     }
 
+    GGML_ASSERT(logical_input->type == GGML_TYPE_F32);
     ggml_cuda_pool_alloc<int8_t> qdata(ctx.pool());
     ggml_cuda_pool_alloc<float> scales(ctx.pool());
     cudaStream_t stream = ctx.stream();
@@ -2648,7 +2660,7 @@ static bool ggml_cuda_use_nvfp4_w4a16_cublas(
     const int cc = ggml_cuda_info().devices[ctx.device].cc;
     return cc == GGML_CUDA_CC_VOLTA
         && src0->type == GGML_TYPE_NVFP4
-        && src1->type == GGML_TYPE_F32
+        && (src1->type == GGML_TYPE_F32 || src1->type == GGML_TYPE_F16)
         && dst->type == GGML_TYPE_F32
         && ggml_cuda_mul_mat_cublas_compute_type(ctx, src0, dst) == GGML_TYPE_F16;
 }
@@ -2671,6 +2683,7 @@ static bool ggml_cuda_use_nvfp4_w4a16_cublas_chunked(
 static bool ggml_cuda_use_nvfp4_w4a16_hmma(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
     return ggml_cuda_use_nvfp4_w4a16_cublas_chunked(ctx, src0, src1, dst)
+        && src1->type == GGML_TYPE_F32
         && src0->ne[1] % 32 == 0;
 }
 
@@ -2716,6 +2729,11 @@ static ggml_cuda_mul_mat_route ggml_cuda_select_mul_mat_route(
                     ? ggml_cuda_mul_mat_route::NVFP4_W4A16_HMMA_SM70
                     : ggml_cuda_mul_mat_route::NVFP4_W4A16_UNSUPPORTED;
         }
+    }
+
+    if (src0->type == GGML_TYPE_NVFP4 && src1->type == GGML_TYPE_F16 &&
+        ggml_cuda_use_nvfp4_w4a16_cublas(ctx, src0, src1, dst)) {
+        return ggml_cuda_mul_mat_route::NVFP4_W4A16_CUBLAS;
     }
 
     // If src0 is a temporary compute buffer it may have some padding that needs to be cleared for mul_mat_vec_q or mul_mat_q.
@@ -2782,12 +2800,17 @@ static void ggml_cuda_mul_mat_nvfp4_w4a16_cublas_chunked(
     cudaStream_t stream = ctx.stream();
     CUBLAS_CHECK(cublasSetStream(ctx.cublas_handle(), stream));
 
-    ggml_cuda_pool_alloc<half> activation(ctx.pool(), k*m);
+    ggml_cuda_pool_alloc<half> activation(ctx.pool());
     ggml_cuda_pool_alloc<half> weights(ctx.pool(), k*tile_n);
-    const to_fp16_cuda_t convert_activation = ggml_get_to_fp16_cuda(src1->type);
+    const half * activation_f16 = static_cast<const half *>(src1->data);
+    if (src1->type != GGML_TYPE_F16) {
+        activation_f16 = activation.alloc(k*m);
+        const to_fp16_cuda_t convert_activation = ggml_get_to_fp16_cuda(src1->type);
+        GGML_ASSERT(convert_activation != nullptr);
+        convert_activation(src1->data, activation.get(), k*m, stream);
+    }
     const to_fp16_cuda_t convert_weights = ggml_get_to_fp16_cuda(src0->type);
-    GGML_ASSERT(convert_activation != nullptr && convert_weights != nullptr);
-    convert_activation(src1->data, activation.get(), k*m, stream);
+    GGML_ASSERT(convert_weights != nullptr);
 
     const float alpha = 1.0f;
     const float beta = 0.0f;
@@ -2798,7 +2821,7 @@ static void ggml_cuda_mul_mat_nvfp4_w4a16_cublas_chunked(
         CUBLAS_CHECK(cublasGemmEx(ctx.cublas_handle(), CUBLAS_OP_T, CUBLAS_OP_N,
                 rows, m, k,
                 &alpha, weights.get(), CUDA_R_16F, k,
-                        activation.get(), CUDA_R_16F, k,
+                        activation_f16, CUDA_R_16F, k,
                 &beta, (float *) dst->data + row, CUDA_R_32F, n,
                 CUBLAS_COMPUTE_32F,
                 CUBLAS_GEMM_DEFAULT_TENSOR_OP));
@@ -2869,15 +2892,19 @@ static void ggml_cuda_mul_mat_nvfp4_w4a16_turbomind(
         GGML_ABORT("failed to prepare SM70 TurboMind NVFP4 weight");
     }
 
-    ggml_cuda_pool_alloc<half> activation(ctx.pool(), k*m);
-    const to_fp16_cuda_t convert_activation = ggml_get_to_fp16_cuda(src1->type);
-    GGML_ASSERT(convert_activation != nullptr);
-    convert_activation(src1->data, activation.get(), k*m, stream);
+    ggml_cuda_pool_alloc<half> activation(ctx.pool());
+    const half * activation_f16 = static_cast<const half *>(src1->data);
+    if (src1->type != GGML_TYPE_F16) {
+        activation_f16 = activation.alloc(k*m);
+        const to_fp16_cuda_t convert_activation = ggml_get_to_fp16_cuda(src1->type);
+        GGML_ASSERT(convert_activation != nullptr);
+        convert_activation(src1->data, activation.get(), k*m, stream);
+    }
 
     if (!ggml_cuda_nvfp4_turbomind_mul_mat(
             ggml_cuda_get_physical_device(ctx.device),
             *prepared,
-            activation.get(),
+            activation_f16,
             m,
             (float *) dst->data,
             workspace.barriers.get(),
@@ -2990,7 +3017,13 @@ static const char * ggml_cuda_mul_mat_route_name(ggml_backend_cuda_context & ctx
     }
     if (src0->type == GGML_TYPE_I8) {
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
-        return ggml_cuda_use_sm70_w8a16(ctx, dst) ? "W8A16_SM70_CUBLAS" : "I8_CUBLAS";
+        if (!ggml_cuda_use_sm70_w8a16(ctx, dst)) {
+            return src1->type == GGML_TYPE_F16 ? "UNSUPPORTED" : "I8_CUBLAS";
+        }
+        const ggml_tensor * logical_input = src1->type == GGML_TYPE_I8 ? dst->src[4] : src1;
+        return logical_input != nullptr && logical_input->type == GGML_TYPE_F16
+            ? "W8A16_SM70_CUBLAS_F16_INPUT"
+            : "W8A16_SM70_CUBLAS";
 #else
         return "UNSUPPORTED";
 #endif
@@ -3008,11 +3041,11 @@ static const char * ggml_cuda_mul_mat_route_name(ggml_backend_cuda_context & ctx
         case ggml_cuda_mul_mat_route::CUBLAS:
             return ggml_cuda_cublas_route_name(ctx, src0, dst);
         case ggml_cuda_mul_mat_route::NVFP4_W4A16_CUBLAS:
-            return "NVFP4_W4A16_CUBLAS";
+            return src1->type == GGML_TYPE_F16 ? "NVFP4_W4A16_CUBLAS_F16_INPUT" : "NVFP4_W4A16_CUBLAS";
         case ggml_cuda_mul_mat_route::NVFP4_W4A16_CUBLAS_CHUNKED:
-            return "NVFP4_W4A16_CUBLAS_CHUNKED";
+            return src1->type == GGML_TYPE_F16 ? "NVFP4_W4A16_CUBLAS_CHUNKED_F16_INPUT" : "NVFP4_W4A16_CUBLAS_CHUNKED";
         case ggml_cuda_mul_mat_route::NVFP4_W4A16_TURBOMIND_SM70:
-            return "NVFP4_W4A16_TURBOMIND_SM70";
+            return src1->type == GGML_TYPE_F16 ? "NVFP4_W4A16_TURBOMIND_SM70_F16_INPUT" : "NVFP4_W4A16_TURBOMIND_SM70";
         case ggml_cuda_mul_mat_route::NVFP4_W4A16_HMMA_SM70:
             return "NVFP4_W4A16_HMMA_SM70";
         case ggml_cuda_mul_mat_route::NVFP4_W4A16_UNSUPPORTED:
@@ -6018,12 +6051,14 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     const int cc = ggml_cuda_info().devices[dev_ctx->device].cc;
                     const bool sm70_w8a16 = volta_mma_available(cc) && convrot_group_size == 256 &&
                                               logical_input != nullptr &&
-                                              logical_input->type == GGML_TYPE_F32 &&
+                                              (logical_input->type == GGML_TYPE_F32 || logical_input->type == GGML_TYPE_F16) &&
                                               logical_input->ne[0] == a->ne[0] &&
                                               ggml_nrows(logical_input) == ggml_nrows(op) &&
                                               ggml_is_contiguous(logical_input) &&
                                               (!packed_input || logical_input == packed_src);
-                    return op->op == GGML_OP_MUL_MAT && (b->type == GGML_TYPE_F32 || packed_input) &&
+                    const bool input_supported = b->type == GGML_TYPE_F32 || packed_input ||
+                                                 (b->type == GGML_TYPE_F16 && sm70_w8a16);
+                    return op->op == GGML_OP_MUL_MAT && input_supported &&
                            op->type == GGML_TYPE_F32 && a->ne[0] % 4 == 0 && a->ne[1] % 4 == 0 &&
                            a->ne[2] == 1 && a->ne[3] == 1 &&
                            ggml_is_contiguous(a) && ggml_is_contiguous(b) && ggml_is_contiguous(op) &&
@@ -6039,7 +6074,11 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     return false;
 #endif
                 }
-                if (b->type == GGML_TYPE_F16 && a->type != GGML_TYPE_F16 &&
+                if (a->type == GGML_TYPE_NVFP4 && b->type == GGML_TYPE_F16 &&
+                    ggml_cuda_get_nvfp4_w4a16_mode() == ggml_cuda_nvfp4_w4a16_mode::HMMA) {
+                    return false;
+                }
+                if (b->type == GGML_TYPE_F16 && a->type != GGML_TYPE_F16 && a->type != GGML_TYPE_NVFP4 &&
                     a->type != GGML_TYPE_F8_E4M3 && a->type != GGML_TYPE_F8_E5M2) {
                     return false;
                 }

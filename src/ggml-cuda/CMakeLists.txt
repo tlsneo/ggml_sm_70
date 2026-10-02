@@ -2,10 +2,10 @@ cmake_minimum_required(VERSION 3.18)  # for CMAKE_CUDA_ARCHITECTURES
 
 find_package(CUDAToolkit)
 
-option(GGML_CUDA_TURBOMIND_SM70 "Build the experimental exact-SM70 TurboMind NVFP4 backend" OFF)
+option(GGML_CUDA_TURBOMIND_SM70 "Build the exact-SM70 TurboMind NVFP4 backend" ON)
 option(GGML_CUDA_CUTLASS_SM70_ATTN "Build the experimental exact-SM70 CUTLASS D128 attention backend" OFF)
 option(GGML_CUDA_FLASHINFER_SM70_ATTN "Build the experimental exact-SM70 FlashInfer D128 attention backend" OFF)
-set(GGML_CUDA_CUTLASS_PATH "" CACHE PATH "CUTLASS source root used by optional SM70 backends")
+set(GGML_CUDA_CUTLASS_PATH "${CMAKE_CURRENT_SOURCE_DIR}/vendors/cutlass" CACHE PATH "CUTLASS source root used by SM70 backends")
 
 if (CUDAToolkit_FOUND)
     message(STATUS "CUDA Toolkit found")
@@ -132,7 +132,7 @@ if (CUDAToolkit_FOUND)
 
     if (GGML_CUDA_TURBOMIND_SM70)
         if (NOT EXISTS "${GGML_CUDA_CUTLASS_PATH}/include/cutlass/cutlass.h")
-            message(FATAL_ERROR "GGML_CUDA_TURBOMIND_SM70 requires GGML_CUDA_CUTLASS_PATH pointing to CUTLASS v4.4.2")
+            message(FATAL_ERROR "CUTLASS v4.4.2 is missing; run git submodule update --init --recursive")
         endif()
 
         set(GGML_CUDA_TURBOMIND_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/vendors/turbomind-sm70")
@@ -168,7 +168,7 @@ if (CUDAToolkit_FOUND)
 
     if (GGML_CUDA_CUTLASS_SM70_ATTN)
         if (NOT EXISTS "${GGML_CUDA_CUTLASS_PATH}/include/cutlass/cutlass.h")
-            message(FATAL_ERROR "GGML_CUDA_CUTLASS_SM70_ATTN requires GGML_CUDA_CUTLASS_PATH pointing to CUTLASS v4.4.2")
+            message(FATAL_ERROR "CUTLASS v4.4.2 is missing; run git submodule update --init --recursive")
         endif()
         set(GGML_CUDA_CUTLASS_SM70_ATTN_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/vendors/cutlass-sm70-attention")
         set(GGML_CUDA_CUTLASS_SM70_ATTN_SOURCE

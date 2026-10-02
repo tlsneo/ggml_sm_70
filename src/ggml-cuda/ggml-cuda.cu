@@ -2711,6 +2711,9 @@ static ggml_cuda_mul_mat_route ggml_cuda_select_mul_mat_route(
     if (src0->type == GGML_TYPE_NVFP4) {
         switch (ggml_cuda_get_nvfp4_w4a16_mode()) {
             case ggml_cuda_nvfp4_w4a16_mode::AUTO:
+                if (ggml_cuda_use_nvfp4_w4a16_turbomind(ctx, src0, src1, dst)) {
+                    return ggml_cuda_mul_mat_route::NVFP4_W4A16_TURBOMIND_SM70;
+                }
                 break;
             case ggml_cuda_nvfp4_w4a16_mode::CUBLAS:
                 return ggml_cuda_use_nvfp4_w4a16_cublas(ctx, src0, src1, dst)

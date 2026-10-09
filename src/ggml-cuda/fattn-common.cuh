@@ -418,24 +418,33 @@ static __device__ __forceinline__ void dequantize_V_q4_0(const void * __restrict
 
     int q;
     static_assert(ne == 2 || ne == 4, "bad ne");
+    // Two 16 bit loads: the 18 B block leaves qs 2 B aligned, and a misaligned 32 bit
+    // load faults on sm_70.
     ggml_cuda_memcpy_1<ne, 2>(&q, x[ib].qs + iqs);
     q >>= 4*shift;
     q &= 0x0F0F0F0F;
-    q = __vsubss4(q, 0x08080808);
-
-    const int8_t * q8 = (const int8_t *) &q;
 
 #ifdef FP16_AVAILABLE
     if constexpr (std::is_same_v<T, half>) {
+        // ref: https://github.com/1115714829/llama.cpp-v100
+        // Vectorized nibble decode: byte_perm packs adjacent nibbles into f16 slots of
+        // 1024 + n (bit pattern 0x6400 | n), hsub2 by 1032 yields n - 8 exactly, so the
+        // half values match make_half2(q8[l0], q8[l0+1]) bit for bit.
         const half2 d = __half2half2(x[ib].d);
+        const unsigned bias_bits = 0x64086408u; // f16 1032, 1032
+        const half2 bias = *reinterpret_cast<const half2 *>(&bias_bits);
 
 #pragma unroll
         for (int l0 = 0; l0 < ne; l0 += 2) {
-            ((half2 *) dst)[l0/2] = d * make_half2(q8[l0 + 0], q8[l0 + 1]);
+            const unsigned packed_pair = __byte_perm((unsigned) q, 0, 0x4140u + 0x0202u*(l0/2)) | 0x64006400u;
+            ((half2 *) dst)[l0/2] = d * __hsub2(*reinterpret_cast<const half2 *>(&packed_pair), bias);
         }
     } else
 #endif // FP16_AVAILABLE
     if constexpr (std::is_same_v<T, float>) {
+        q = __vsubss4(q, 0x08080808);
+
+        const int8_t * q8 = (const int8_t *) &q;
         const float d = x[ib].d;
 
 #pragma unroll

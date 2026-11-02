@@ -191,6 +191,7 @@ endif()
 
 add_library(ggml-base
             ../include/ggml.h
+            ../include/ggml-sm70.h
             ../include/ggml-alloc.h
             ../include/ggml-backend.h
             ../include/ggml-cpp.h
@@ -200,6 +201,8 @@ add_library(ggml-base
             ggml.cpp
             ggml-alloc.c
             ggml-backend.cpp
+            ggml-ext.cpp
+            ggml-graph.cpp
             ggml-backend-meta.cpp
             ggml-opt.cpp
             ggml-threading.cpp

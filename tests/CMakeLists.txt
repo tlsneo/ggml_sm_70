@@ -159,6 +159,7 @@ endif()
 # undefine NDEBUG so asserts don't get disabled in tests
 add_definitions(-UNDEBUG)
 
+
 #
 # test-backend-ops
 
@@ -173,7 +174,28 @@ add_executable(${TEST_TARGET} ${TEST_TARGET}.c)
 target_link_libraries(${TEST_TARGET} PRIVATE ggml)
 add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
 
+set(TEST_TARGET test-ggml-ext-compat)
+add_executable(${TEST_TARGET} ${TEST_TARGET}.cpp)
+target_link_libraries(${TEST_TARGET} PRIVATE ggml)
+add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
+
 if (NOT GGML_BACKEND_DL)
+    #
+    # test-fp8-cast
+
+    set(TEST_TARGET test-fp8-cast)
+    add_executable(${TEST_TARGET} ${TEST_TARGET}.cpp)
+    target_link_libraries(${TEST_TARGET} PRIVATE ggml)
+    add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
+
+    #
+    # test-fp8-matmul
+
+    set(TEST_TARGET test-fp8-matmul)
+    add_executable(${TEST_TARGET} ${TEST_TARGET}.cpp)
+    target_link_libraries(${TEST_TARGET} PRIVATE ggml)
+    add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
+
     #
     # test-opt
     set(TEST_TARGET test-opt)

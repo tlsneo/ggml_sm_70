@@ -1,4 +1,5 @@
 #include "sage-attn.cuh"
+#include "ggml-sm70.h"
 
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && __CUDACC_VER_MAJOR__ >= 12
 

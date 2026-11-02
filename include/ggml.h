@@ -646,6 +646,7 @@ extern "C" {
         GGML_GLU_OP_GEGLU_ERF,
         GGML_GLU_OP_GEGLU_QUICK,
         GGML_GLU_OP_SWIGLU_CLAMP,
+        GGML_GLU_OP_SITU,
 
         GGML_GLU_OP_COUNT,
     };
@@ -1509,14 +1510,6 @@ extern "C" {
             struct ggml_tensor  * a,
             struct ggml_tensor  * b);
 
-    GGML_API struct ggml_tensor * ggml_mul_mat_i8_tensorwise(
-            struct ggml_context * ctx,
-            struct ggml_tensor  * weight,
-            struct ggml_tensor  * input,
-            struct ggml_tensor  * weight_scale,
-            struct ggml_tensor  * bias,
-            int                   convrot_group_size);
-
     // change the precision of a matrix multiplication
     // set to GGML_PREC_F32 for higher precision (useful for phi-2)
     GGML_DEPRECATED(GGML_API void ggml_mul_mat_set_prec(
@@ -1528,12 +1521,6 @@ extern "C" {
     GGML_API void ggml_mul_mat_set_hint(
             struct ggml_tensor * a,
             enum ggml_op_hint    hint);
-
-    // Packs row-wise I8 activations followed by one F32 scale per row.
-    GGML_API struct ggml_tensor * ggml_quantize_i8_convrot(
-            struct ggml_context * ctx,
-            struct ggml_tensor  * a,
-            int                   group_size);
 
     // indirect matrix multiplication
     // an id of -1 skips the slot and zeroes the matching row of the result
@@ -2554,31 +2541,6 @@ extern "C" {
             float                 scale,
             float                 kv_scale,
             float                 eps);
-
-    enum ggml_sage_attn_mode {
-        GGML_SAGE_ATTN_AUTO = 0,
-        GGML_SAGE_ATTN_2,
-        GGML_SAGE_ATTN_2_PLUS_PLUS,
-    };
-
-    // Q/K: contiguous F32 [D, tokens, heads, batch], V: contiguous F16 in the same layout.
-    // Output: F32 [D, query heads, query tokens, batch]. CUDA-only, unmasked inference.
-    GGML_API struct ggml_tensor * ggml_sage_attn(
-            struct ggml_context * ctx,
-            struct ggml_tensor  * q,
-            struct ggml_tensor  * k,
-            struct ggml_tensor  * v,
-            float                 scale,
-            enum ggml_sage_attn_mode mode);
-
-    // Noncausal Sol-Attn: contiguous F32 Q/K/V [D=128, T, H, B], output [D, H, T, B].
-    GGML_API struct ggml_tensor* ggml_sol_attn(
-        struct ggml_context* ctx,
-        struct ggml_tensor* q,
-        struct ggml_tensor* k,
-        struct ggml_tensor* v,
-        float scale,
-        float tau);
 
     GGML_DEPRECATED(GGML_API void ggml_flash_attn_ext_set_prec(
             struct ggml_tensor * a,

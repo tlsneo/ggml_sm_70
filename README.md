@@ -49,6 +49,9 @@ H3 既有构建显式使用 `GGML_CUDA_TURBOMIND_SM70=OFF`；其 INT8 ConvRot �
 
 - 上游的 `ggml_clamp` 现在返回新的张量；需要原地修改时改用 `ggml_clamp_inplace`。
 - 本分支的 RPC 协议版本为 9，客户端和服务端均须使用兼容本分支的版本。
+- 原生 INT8 ConvRot、Sage 和 Sol 构造器改从 `ggml-sm70.h` 声明，避免与 sd.cpp 的扩展接口重名；已有二进制符号不变。
+- 扩展 ABI 为 2，需用本分支头文件重新编译扩展；sd.cpp 的自定义 INT8 算子使用其应用侧内核，不会自动进入本分支的原生 INT8 路由。
+- 启用 TurboMind 时，SM70 NVFP4 图暂不使用 CUDA Graph，以避免权重缓存失效后重放旧指针。
 - Vulkan INT8 ConvRot 暂不支持 UMA 设备，需由其他后端执行。
 
 ---

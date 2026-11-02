@@ -460,6 +460,7 @@ struct vk_op_diag_mask_push_constants {
     int32_t n_past;
 };
 
+
 struct vk_op_rope_push_constants {
     uint32_t rope_mode;
     uint32_t nrows;
@@ -875,6 +876,19 @@ struct vk_mul_mat_i8_tensorwise_push_constants {
     uint32_t k;
     uint32_t has_bias;
     uint32_t row_offset;
+};
+
+struct vk_concat_cast_f16_push_constants {
+    uint32_t prefix, tokens, heads, batches;
+    uint32_t a_stride[3], b_stride[3];
+    uint32_t a_offset, b_offset, d_offset;
+};
+
+struct vk_scale_cast_f16_push_constants {
+    uint32_t columns, tokens, heads, batches;
+    uint32_t stride[3];
+    uint32_t x_offset, d_offset;
+    float scale, bias;
 };
 
 struct vk_op_flash_attn_split_k_reduce_push_constants {

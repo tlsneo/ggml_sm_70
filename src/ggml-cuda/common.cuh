@@ -379,6 +379,14 @@ static bool blackwell_mma_available(const int cc) {
            ggml_cuda_highest_compiled_arch(cc) < GGML_CUDA_CC_RUBIN;
 }
 
+// Architectures validated for the cuBLAS/hipBLAS i8xi8 -> i32 GEMM route.
+// Do not widen this set without correctness evidence on the target architecture.
+static bool ggml_cuda_i8_blas_available(const int cc) {
+    return turing_mma_available(cc) || GGML_CUDA_CC_IS_CDNA(cc) ||
+           GGML_CUDA_CC_IS_RDNA2(cc) || GGML_CUDA_CC_IS_RDNA3(cc) ||
+           GGML_CUDA_CC_IS_RDNA4(cc);
+}
+
 // Checks whether the tensor's base data pointer and higher-dimensional strides are byte-aligned to `alignment` bytes.
 static bool ggml_cuda_is_aligned(const ggml_tensor * tensor, const size_t alignment) {
     GGML_ASSERT(tensor != nullptr);

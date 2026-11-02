@@ -1,5 +1,6 @@
 #include "ggml.h"
 #include "ggml-backend.h"
+#include "ggml-sm70.h"
 
 #include <string.h>
 
@@ -27,6 +28,10 @@ int main(void) {
     GGML_ASSERT(attn->op_params[4] == 3);
     GGML_ASSERT(actual_kv_scale == kv_scale && actual_eps == eps);
     GGML_ASSERT(ggml_prec_get_acc(attn) == GGML_PREC_F32);
+
+    struct ggml_tensor * v_f16 = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, 128, 2, 3, 1);
+    GGML_ASSERT(ggml_sage_attn(ctx, q, q, v_f16, 1.0f, GGML_SAGE_ATTN_AUTO)->op == GGML_OP_SAGE_ATTN);
+    GGML_ASSERT(ggml_sol_attn(ctx, q, q, q, 1.0f, 0.0f)->op == GGML_OP_SOL_ATTN);
 
     struct ggml_tensor * glu = ggml_swiglu_split_f16(ctx, q, q);
     struct ggml_tensor * oai = ggml_swiglu_oai(ctx, q, q, 1.702f, 7.0f);

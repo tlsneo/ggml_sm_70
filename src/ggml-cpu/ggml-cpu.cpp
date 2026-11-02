@@ -397,6 +397,7 @@ static void ggml_backend_cpu_device_get_props(ggml_backend_dev_t dev, struct ggm
         /* .host_buffer           = */ false,
         /* .buffer_from_host_ptr  = */ true,
         /* .events                = */ false,
+        /* .mmap_support          = */ true,
     };
 }
 
@@ -423,7 +424,7 @@ static ggml_backend_buffer_t ggml_backend_cpu_device_buffer_from_host_ptr(ggml_b
 static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
     if (op->op == GGML_OP_SAGE_ATTN || op->op == GGML_OP_SOL_ATTN ||
         (op->op == GGML_OP_FLASH_ATTN_EXT && op->src[5] != nullptr) ||
-        (op->op == GGML_OP_GLU && ggml_get_op_params_i32(op, 2) == 1)) {
+        (op->op == GGML_OP_GLU && op->src[0] != nullptr && op->type != op->src[0]->type)) {
         return false;
     }
     const struct ggml_tensor * src0 = op->src[0];
@@ -446,6 +447,12 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
     switch (op->op) {
         case GGML_OP_CPY:
         case GGML_OP_SET_ROWS:
+            if (op->type == GGML_TYPE_F8_E4M3 || op->type == GGML_TYPE_F8_E5M2) {
+                return op->op == GGML_OP_CPY && src0->type == op->type;
+            }
+            if (op->op == GGML_OP_CPY && (src0->type == GGML_TYPE_F8_E4M3 || src0->type == GGML_TYPE_F8_E5M2)) {
+                return op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16 || op->type == GGML_TYPE_BF16;
+            }
             return
                 op->type != GGML_TYPE_IQ3_XXS &&
                 op->type != GGML_TYPE_IQ3_S   &&
@@ -455,21 +462,31 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
                 op->type != GGML_TYPE_IQ1_S   &&
                 op->type != GGML_TYPE_IQ1_M; // missing type_traits.from_float
         case GGML_OP_MUL_MAT:
+            if (src0->type == GGML_TYPE_F8_E4M3 || src0->type == GGML_TYPE_F8_E5M2) {
+                return false;
+            }
             if (src0->type == GGML_TYPE_I8) {
                 const ggml_tensor * weight_scale = op->src[2];
                 const ggml_tensor * bias         = op->src[3];
                 const int convrot_group_size     = ggml_get_op_params_i32(op, 2);
-                const ggml_tensor * packed_src   = src1->src[0];
-                const int64_t packed_rows = packed_src != nullptr ? GGML_PAD(ggml_nrows(packed_src), 4) : 0;
-                const int64_t packed_scale_rows = packed_src != nullptr
-                    ? (ggml_nrows(packed_src) * (int64_t)sizeof(float) + src0->ne[0] - 1) / src0->ne[0]
-                    : 0;
-                const bool packed_input          = src1->type == GGML_TYPE_I8 &&
-                                                   src1->op == GGML_OP_QUANTIZE_I8_CONVROT &&
-                                                   packed_src != nullptr && src1->ne[0] == src0->ne[0] &&
-                                                   src1->ne[1] == packed_rows + packed_scale_rows;
-                return (src1->type == GGML_TYPE_F32 || packed_input) && op->type == GGML_TYPE_F32 &&
-                       src0->ne[2] == 1 && src0->ne[3] == 1 &&
+                const ggml_prec src1_prec        = ggml_prec_get_src(op, 1);
+                const ggml_tensor * logical_src = src1->type == GGML_TYPE_I8 ? op->src[4] : src1;
+                if (logical_src == nullptr || logical_src->type != GGML_TYPE_F32 ||
+                    !ggml_is_contiguous(logical_src) || src0->ne[0] <= 0) {
+                    return false;
+                }
+                const int64_t rows = ggml_nrows(logical_src);
+                const int64_t packed_rows = GGML_PAD(rows, 4);
+                const int64_t packed_scale_rows = (rows * (int64_t)sizeof(float) + src0->ne[0] - 1) / src0->ne[0];
+                const bool packed_input = src1->type == GGML_TYPE_I8 && src1->ne[0] == src0->ne[0] &&
+                                          src1->ne[1] == packed_rows + packed_scale_rows &&
+                                          src1->ne[2] == 1 && src1->ne[3] == 1;
+                return ((src1->type == GGML_TYPE_F32 &&
+                         (src1_prec == GGML_PREC_UNDEFINED || src1_prec == GGML_PREC_Q8 || src1_prec == GGML_PREC_Q4)) ||
+                        packed_input) && op->type == GGML_TYPE_F32 &&
+                       logical_src->ne[0] == src0->ne[0] && op->ne[0] == src0->ne[1] &&
+                       op->ne[1] == logical_src->ne[1] && op->ne[2] == logical_src->ne[2] &&
+                       op->ne[3] == logical_src->ne[3] && src0->ne[2] == 1 && src0->ne[3] == 1 &&
                        ggml_is_contiguous(src0) && ggml_is_contiguous(src1) && ggml_is_contiguous(op) &&
                        (weight_scale == nullptr ||
                         (weight_scale->type == GGML_TYPE_F32 && ggml_is_contiguous(weight_scale) &&
@@ -478,9 +495,16 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
                         (bias->type == GGML_TYPE_F32 && ggml_is_contiguous(bias) &&
                          ggml_nelements(bias) == src0->ne[1])) &&
                        (convrot_group_size == 0 ||
-                        (convrot_group_size <= 256 && src0->ne[0] % convrot_group_size == 0));
+                        (convrot_group_size > 0 && convrot_group_size <= 256 && src0->ne[0] % convrot_group_size == 0));
             }
-            return src1->type == GGML_TYPE_F32 || src1->type == ggml_get_type_traits_cpu(src0->type)->vec_dot_type;
+            if (ggml_get_op_params_i32(op, 1) == GGML_HINT_SRC0_IS_HADAMARD &&
+                src0->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32) {
+                return src1->type == GGML_TYPE_F32 || src1->type == GGML_TYPE_F16;
+            }
+            // BF16 in src1 is widened into the F32 work buffer
+            return src1->type == GGML_TYPE_F32 ||
+                   src1->type == ggml_get_type_traits_cpu(src0->type)->vec_dot_type ||
+                   (src1->type == GGML_TYPE_BF16 && ggml_get_type_traits_cpu(src0->type)->vec_dot_type == GGML_TYPE_F32);
         case GGML_OP_QUANTIZE_I8_CONVROT: {
             const int group_size = ggml_get_op_params_i32(op, 0);
             return src0->type == GGML_TYPE_F32 && op->type == GGML_TYPE_I8 &&
@@ -507,6 +531,8 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
                 src1->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32;
         case GGML_OP_CONV_2D:
             return ggml_is_contiguous(op->src[0]);
+        case GGML_OP_SSM_SCAN:
+            return ggml_get_op_params_i32(op, 0) == 1 || op->src[3]->ne[0] == 1;
         default:
             return true;
     }

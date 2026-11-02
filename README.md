@@ -45,26 +45,31 @@ H3 既有构建显式使用 `GGML_CUDA_TURBOMIND_SM70=OFF`；其 INT8 ConvRot �
 
 默认 CUTLASS 来源是仓库内固定子模块；先递归初始化，不复制其他项目的绝对 `.deps` 路径。切换组合使用新的构建目录，保留原可用二进制。上述性能来自既有算子对照，不表示迁移后的新二进制已经重新完成 V100 整模验证。
 
+### 上游合并兼容性
+
+- 上游的 `ggml_clamp` 现在返回新的张量；需要原地修改时改用 `ggml_clamp_inplace`。
+- 本分支的 RPC 协议版本为 9，客户端和服务端均须使用兼容本分支的版本。
+- Vulkan INT8 ConvRot 暂不支持 UMA 设备，需由其他后端执行。
+
 ---
 
 [Manifesto](https://github.com/ggerganov/llama.cpp/discussions/205)
 
-Tensor library for machine learning
+<div align="center">
 
-***Note that this project is under active development. \
-Some of the development is currently happening in the [llama.cpp](https://github.com/ggerganov/llama.cpp) and [whisper.cpp](https://github.com/ggerganov/whisper.cpp) repos***
+<img src="https://raw.githubusercontent.com/ggml-org/media/refs/heads/master/logo/ggml-logo.jpg" width="256" height="256" alt="ggml logo" />
 
-## Features
+<b>Tensor library for machine learning</b>
 
-- Low-level cross-platform implementation
-- Integer quantization support
-- NVIDIA Volta SM70 optimized CUDA kernels
-- Automatic differentiation
-- ADAM and L-BFGS optimizers
-- Pinned CUTLASS v4.4.2 dependency
-- Zero memory allocations during runtime
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://opensource.org/licenses/MIT)
+[![Release](https://img.shields.io/github/v/release/ggml-org/ggml?filter=v*)](https://github.com/ggml-org/ggml/releases)
+[![CI](https://github.com/ggml-org/ggml/actions/workflows/build-cpu.yml/badge.svg)](https://github.com/ggml-org/ggml/actions/workflows/build-cpu.yml)
 
-## Build
+</div>
+
+## Quick start
+
+Build from source:
 
 ```bash
 git clone --recurse-submodules https://github.com/tlsneo/ggml_sm_70.git
@@ -81,17 +86,26 @@ cmake .. -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=70
 cmake --build . --config Release -j 8
 ```
 
-## GPT inference (example)
+For a minimal, fully commented example (matrix multiplication), see [examples/simple](examples/simple).
 
-```bash
-# run the GPT-2 small 117M model
-../examples/gpt-2/download-ggml-model.sh 117M
-./bin/gpt-2-backend -m models/gpt-2-117M/ggml-model.bin -p "This is an example"
-```
+## Description
 
-For more information, checkout the corresponding programs in the [examples](examples) folder.
+The main goal of `ggml` is to be a simple, portable, and efficient tensor library for machine learning with minimal setup.
 
-## Resources
+- Plain C/C++ core; SM70 CUDA backends use the pinned CUTLASS submodule
+- Cross-platform - x86, ARM, RISC-V, LoongArch, PowerPC, s390x, and WebAssembly
+- SIMD-optimized kernels for x86, ARM, and RISC-V
+- Broad backend support - CPU, GPU, NPU, and browser, with optimized NVIDIA Volta SM70 kernels
+- Automatic differentiation and ADAM and L-BFGS optimizers
+- 2- to 8-bit integer quantization, plus MXFP4 and NVFP4 microscaling formats
+- Zero memory allocations during runtime
 
+## Documentation
+
+- [The GGUF file format](docs/gguf.md)
 - [Introduction to ggml](https://huggingface.co/blog/introduction-to-ggml)
-- [The GGUF file format](https://github.com/ggerganov/ggml/blob/master/docs/gguf.md)
+- [GGML tips & tricks](https://github.com/ggml-org/llama.cpp/wiki/GGML-Tips-&-Tricks)
+
+## Contributing
+
+- For changes to the core `ggml` library (including to the CMake build system), please open a PR in [llama.cpp](https://github.com/ggml-org/llama.cpp) - doing so will make your PR more visible, better tested, and more likely to be reviewed
